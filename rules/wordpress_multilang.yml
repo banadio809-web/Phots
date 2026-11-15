@@ -14,6 +14,9 @@ rules:
           - pattern: $_GET[...]
           - pattern: $_POST[...]
           - pattern: $_REQUEST[...]
+          - pattern: $_COOKIE[...]
+          - pattern: $REQUEST->get_param(...)
+          - pattern: $REQUEST->get_json_params()
     pattern-sanitizers:
       - pattern: $wpdb->prepare(...)
       - pattern: esc_sql(...)
@@ -41,6 +44,10 @@ rules:
           - pattern: $_GET[...]
           - pattern: $_POST[...]
           - pattern: $_REQUEST[...]
+          - pattern: $_COOKIE[...]
+          - pattern: $REQUEST->get_param(...)
+          - pattern: $REQUEST->get_json_params()
+          - pattern: shortcode_atts(...)
     pattern-sanitizers:
       - pattern: esc_html(...)
       - pattern: esc_attr(...)
@@ -69,6 +76,9 @@ rules:
           - pattern: $_GET[...]
           - pattern: $_POST[...]
           - pattern: $_REQUEST[...]
+          - pattern: $_COOKIE[...]
+          - pattern: $REQUEST->get_param(...)
+          - pattern: $REQUEST->get_json_params()
     pattern-sanitizers:
       - pattern: escapeshellarg(...)
       - pattern: escapeshellcmd(...)
@@ -95,12 +105,43 @@ rules:
           - pattern: $_GET[...]
           - pattern: $_POST[...]
           - pattern: $_REQUEST[...]
+          - pattern: $_COOKIE[...]
+          - pattern: $REQUEST->get_param(...)
+          - pattern: $REQUEST->get_json_params()
     pattern-sinks:
       - pattern-either:
           - pattern: include $PATH;
           - pattern: include_once $PATH;
           - pattern: require $PATH;
           - pattern: require_once $PATH;
+
+  - id: wp-filesystem-path-taint
+    languages: [php]
+    mode: taint
+    severity: WARNING
+    message: Request data may reach a filesystem path operation; verify canonical containment and authorization.
+    metadata:
+      category: security
+      confidence: MEDIUM
+      wp_class: directory_traversal
+      technology: [wordpress, php]
+    pattern-sources:
+      - pattern-either:
+          - pattern: $_GET[...]
+          - pattern: $_POST[...]
+          - pattern: $_REQUEST[...]
+          - pattern: $_COOKIE[...]
+          - pattern: $REQUEST->get_param(...)
+          - pattern: $REQUEST->get_json_params()
+    pattern-sinks:
+      - pattern: file_get_contents($PATH, ...)
+      - pattern: file_put_contents($PATH, ...)
+      - pattern: fopen($PATH, ...)
+      - pattern: readfile($PATH, ...)
+      - pattern: unlink($PATH)
+      - pattern: rmdir($PATH)
+      - pattern: rename($PATH, ...)
+      - pattern: copy($PATH, ...)
 
   - id: wp-arbitrary-php-upload-taint
     languages: [php]
@@ -115,7 +156,10 @@ rules:
     pattern-sources:
       - pattern: $_FILES[...]
     pattern-sinks:
-      - pattern: move_uploaded_file($TEMP, $DEST)
+      - pattern-either:
+          - pattern: move_uploaded_file($TEMP, $DEST)
+          - pattern: wp_handle_upload($FILE, ...)
+          - pattern: wp_handle_sideload($FILE, ...)
 
   - id: wp-unserialize-taint
     languages: [php]
@@ -132,6 +176,9 @@ rules:
           - pattern: $_GET[...]
           - pattern: $_POST[...]
           - pattern: $_REQUEST[...]
+          - pattern: $_COOKIE[...]
+          - pattern: $REQUEST->get_param(...)
+          - pattern: $REQUEST->get_json_params()
     pattern-sinks:
       - pattern: unserialize($DATA)
 
@@ -150,10 +197,39 @@ rules:
           - pattern: $_GET[...]
           - pattern: $_POST[...]
           - pattern: $_REQUEST[...]
+          - pattern: $REQUEST->get_param(...)
+          - pattern: $REQUEST->get_json_params()
     pattern-sinks:
       - patterns:
           - pattern: update_option($NAME, ...)
           - focus-metavariable: $NAME
+
+  - id: wp-sensitive-state-change-taint
+    languages: [php]
+    mode: taint
+    severity: WARNING
+    message: Request data may influence a sensitive state change; verify capability, ownership, nonce, and workflow preconditions.
+    metadata:
+      category: security
+      confidence: MEDIUM
+      wp_class: authorization_bypass
+      technology: [wordpress, php]
+    pattern-sources:
+      - pattern-either:
+          - pattern: $_GET[...]
+          - pattern: $_POST[...]
+          - pattern: $_REQUEST[...]
+          - pattern: $REQUEST->get_param(...)
+          - pattern: $REQUEST->get_json_params()
+    pattern-sinks:
+      - pattern-either:
+          - pattern: update_option(..., $VALUE, ...)
+          - pattern: delete_option($NAME)
+          - pattern: wp_delete_post($ID, ...)
+          - pattern: delete_user_meta($ID, ...)
+          - pattern: wp_insert_user($DATA)
+          - pattern: wp_update_user($DATA)
+          - pattern: $USER->set_role($ROLE)
 
   - id: wp-user-role-taint
     languages: [php]

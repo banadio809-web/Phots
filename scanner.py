@@ -17,9 +17,11 @@ import json
 import re
 import queue as queue_module
 import shutil
+import site
 import sqlite3
 import subprocess
 import sys
+import sysconfig
 import tempfile
 import threading
 import time
@@ -52,7 +54,18 @@ RULES = [
 ]
 
 SOURCE_EXTENSIONS = {".php", ".py", ".go", ".rs"}
-LOCAL_RULES = Path(__file__).resolve().parent / "rules" / "wordpress_multilang.yml"
+
+
+def local_rules_path():
+    candidates = [
+        Path(__file__).resolve().parent / "rules" / "wordpress_multilang.yml",
+        Path(sysconfig.get_path("data")) / "share" / "phots" / "rules" / "wordpress_multilang.yml",
+        Path(site.getuserbase()) / "share" / "phots" / "rules" / "wordpress_multilang.yml",
+    ]
+    return next((candidate for candidate in candidates if candidate.is_file()), candidates[0])
+
+
+LOCAL_RULES = local_rules_path()
 
 VULN_LABELS = {
     "sql_injection": "SQL injection",
@@ -520,49 +533,63 @@ def draw_phots_tui(state: dict, recent: list[dict], *, paused: bool = False):
     width = max(60, min(110, terminal_size().columns - 2))
     inner = width - 4
     cyan, blue, green, yellow, muted, reset = "\x1b[96m", "\x1b[94m", "\x1b[92m", "\x1b[93m", "\x1b[90m", "\x1b[0m"
+
     def clip(value, limit=inner):
         value = re.sub(r"\s+", " ", str(value))
         return value if len(value) <= limit else value[:max(1, limit - 1)] + "…"
+
     def box(title, rows, color=cyan):
         top = f"┌─ {title} " + "─" * max(0, width - len(title) - 5) + "┐"
         return [color + top + reset] + [f"│ {clip(row):<{inner}} │" for row in rows] + [color + "└" + "─" * (width - 2) + "┘" + reset]
-    latest = recent[-5:]
-    findings = [f"{r['plugin_slug']} · {r.get('class_hint') or 'unclassified'} · {r['file']}:{r['line']}" for r in latest]
+
+    def worker_meter(active, total, length=16):
+        filled = round(length * min(active, total) / max(total, 1))
+        return "[" + "█" * filled + "·" * (length - filled) + "]"
+
+    latest = recent[-4:]
+    findings = [
+        f"{r.get('plugin_slug', 'plugin')} · {r.get('class_hint') or 'unclassified'} · "
+        f"{r.get('file', '?')}:{r.get('line', '?')}"
+        for r in latest
+    ]
     if not findings:
-        findings = ["No signals yet. Phots is warming up…"]
-    phase = "PAUSED" if paused else state.get("status", "STARTING").upper()
-    headline = [f"{cyan}██████╗ ██╗  ██╗ ██████╗ ████████╗███████╗{reset}",
-                f"{cyan}██╔══██╗██║  ██║██╔═══██╗╚══██╔══╝██╔════╝{reset}",
-                f"{cyan}██████╔╝███████║██║   ██║   ██║   ███████╗{reset}",
-                f"{cyan}██╔═══╝ ██╔══██║██║   ██║   ██║   ╚════██║{reset}",
-                f"{cyan}██║     ██║  ██║╚██████╔╝   ██║   ███████║  PLUGIN RESEARCH STREAM{reset}",
-                f"{muted}Source-only analysis · human validation required · Ctrl+C stops cleanly{reset}"]
+        findings = list(state.get("recent_signal_lines", []))[-4:]
+    if not findings:
+        findings = ["No leads yet — Phots will show review candidates here."]
+    workers = max(1, int(state.get("workers", 1) or 1))
+    active = max(0, int(state.get("active", 0) or 0))
+    queued = max(0, int(state.get("queued", 0) or 0))
+    frame = "|/-\\"[int(time.monotonic() * 4) % 4]
+    phase = "PAUSED" if paused else str(state.get("status", "starting"))
+    phase_color = yellow if paused or "waiting" in phase.lower() else green
+    activity_mark = frame if active or phase.lower() in {"running", "starting"} else "·"
+    headline = [
+        f"{cyan}PHOTS  /  WORDPRESS PLUGIN RESEARCH{reset}",
+        f"{muted}Welcome. Follow each source-review lead with human validation; signals are not confirmed bugs.{reset}",
+        f"{muted}Discover releases  →  inspect source locally  →  remember completed versions  →  review leads{reset}",
+    ]
     body = []
-    body.extend(box("LIVE STATUS", [
-        f"Mode: {phase}     Plugins scanned: {state.get('scanned', 0)}     New signals: {state.get('signal_count', 0)}",
-        f"Active workers: {state.get('active', 0)}/{state.get('workers', 1)}     Queue: {state.get('queued', 0)}     Errors: {state.get('failures', 0)}",
-        f"AI triage: {state.get('ai_reviewed', 0)} reviewed · {state.get('ai_closed', 0)} false-positive closures · {state.get('ai_bug_candidates', 0)} bug candidates · {state.get('ai_errors', 0)} errors",
-        f"AI endpoint: {'enabled · ' + str(state.get('ai_model')) if state.get('ai_enabled') else 'disabled'}",
-        f"Latest: {state.get('last_plugin') or 'waiting for first plugin'}",
-        f"Retry status: {state.get('retry_note', 'none')}",
-        f"Latest issue: {state.get('last_error', 'none')}",
-        f"Semgrep detail: {state.get('last_semgrep_error', 'none')}",
-        f"Feed note: {state.get('scan_note', 'none')}",
-        f"Uptime: {state.get('uptime', '0s')}     Poll interval: {state.get('poll_seconds', 30)}s",
+    body.extend(box("LIVE SCAN", [
+        f"{activity_mark} {phase_color}{phase}{reset}  {worker_meter(active, workers)}  "
+        f"{active}/{workers} active · {queued} queued",
+        f"Completed versions: {state.get('scanned', 0)}  ·  Review leads: {state.get('signal_count', 0)}  ·  "
+        f"Errors: {state.get('failures', 0)}  ·  Uptime: {state.get('uptime', '0s')}",
+        f"Last completed: {state.get('last_plugin') or 'waiting for first plugin'}",
+        f"AI triage: {'on · ' + str(state.get('ai_model')) if state.get('ai_enabled') else 'off'}  ·  "
+        f"Semgrep: {'available' if state.get('semgrep_available') else 'not detected'}",
     ], green))
-    if state.get("job_lines"):
-        body.extend(box("WHAT EACH WORKER IS DOING", state["job_lines"], cyan))
-    body.extend(box("RESOURCE FIT", [
-        f"Free physical memory now: {state.get('current_memory_gb', state.get('available_memory_gb', 'unknown'))} GiB",
-        f"Recommended streams: {state.get('recommended', 1)} of max {state.get('max_workers', 10)}",
-        f"Quick fit check (1/2/3/4/10): {state.get('stream_options', 'calculating')}",
-        f"Basis: {state.get('recommendation', 'checking system resources')}",
-        f"Output: {state.get('report_path', 'phots-live-report.html')}",
-        f"Live log: {state.get('log_path', 'phots-live.log')}",
-        f"Designer handoff: {state.get('handoff_path', 'phots-designer-handoff.md')}",
+    activity = state.get("job_lines") or ["Waiting for the next catalog check."]
+    body.extend(box("CURRENT ACTIVITY", activity[:4], cyan))
+    body.extend(box("SYSTEM & OUTPUT", [
+        f"Free RAM: {state.get('current_memory_gb', state.get('available_memory_gb', 'unknown'))} GiB  ·  "
+        f"Recommended workers: {state.get('recommended', 1)}/{state.get('max_workers', 10)}",
+        f"Feed poll: every {state.get('poll_seconds', 30)}s  ·  Output: {state.get('report_path', 'output/phots-live-report.html')}",
     ], blue))
     body.extend(box("LATEST SIGNALS · leads, not confirmed bugs", findings, yellow))
-    body.extend([f"{muted}Controls: Ctrl+C stop and save  ·  report refreshes after each plugin{reset}"])
+    body.extend([
+        f"{muted}P pause/resume · Q quit cleanly · Ctrl+C stop and save · drift checks are a separate scan mode{reset}",
+        f"{muted}No plugin code is executed; the HTML report refreshes as work completes.{reset}",
+    ])
     sys.stdout.write("\x1b[2J\x1b[H" + "\n".join(headline + body) + "\n")
     sys.stdout.flush()
 
@@ -601,7 +628,8 @@ def stream(args):
         handoff_path = Path.cwd() / handoff_path
     live_log = PhotsLiveLog(log_path, handoff_path)
     max_workers = min(args.max_workers, 10)
-    recommended, available_gb, basis = concurrency_recommendation(max_workers, bool(shutil.which("semgrep")))
+    semgrep_enabled = bool(shutil.which("semgrep"))
+    recommended, available_gb, basis = concurrency_recommendation(max_workers, semgrep_enabled)
     workers = args.workers or recommended
     workers = min(max_workers, workers)
     if workers > recommended:
@@ -616,7 +644,8 @@ def stream(args):
              "max_workers": max_workers, "report_path": str(report_path),
              "log_path": str(log_path), "handoff_path": str(handoff_path),
              "poll_seconds": args.poll_seconds, "scanned": 0, "signal_count": 0,
-             "failures": 0, "last_plugin": None, "active": 0, "queued": 0}
+             "failures": 0, "last_plugin": None, "active": 0, "queued": 0,
+             "semgrep_available": semgrep_enabled}
     state["ai_enabled"] = bool(ai_reviewer)
     if ai_reviewer:
         state["ai_model"] = ai_reviewer.config.model
@@ -685,6 +714,11 @@ def stream(args):
             state["ai_needs_human"] = triage_counts.get("needs_human", 0)
         recent_rows = db.execute("SELECT record FROM signals ORDER BY completed_at DESC LIMIT 250").fetchall()
         recent_records = [json.loads(r[0]) for r in reversed(recent_rows)]
+        state["recent_signal_lines"] = [
+            f"{record.get('plugin_slug', 'plugin')} · {record.get('class_hint') or 'unclassified'} · "
+            f"{record.get('file', '?')}:{record.get('line', '?')}"
+            for record in recent_records[-4:]
+        ]
         plugins = []
         p_rows = db.execute("SELECT slug,version,name,installs FROM completed ORDER BY completed_at DESC LIMIT 250").fetchall()
         for slug, version, name, installs in p_rows:
@@ -719,7 +753,7 @@ def stream(args):
     last_console_heartbeat = time.monotonic()
     live_log.event("INFO", "stream_started", workers=workers, recommended=recommended,
                    free_ram_gib=available_gb, cpu_cores=os.cpu_count(), feed=args.browse,
-                   min_installs=args.min_installs, semgrep=bool(shutil.which("semgrep")),
+                   min_installs=args.min_installs, semgrep=semgrep_enabled,
                    ai_enabled=bool(ai_reviewer), ai_model=(ai_reviewer.config.model if ai_reviewer else None),
                    supabase=bool(store), report=report_path)
     publish()
@@ -1024,8 +1058,49 @@ AUDIT_MANIFESTS = {
 }
 AUDIT_IGNORED_DIRS = {
     ".git", ".next", ".pytest_cache", ".tox", ".venv", "__pycache__",
-    "build", "dist", "node_modules", "vendor", "venv",
+    "build", "coverage", "dist", "node_modules", "output", "target",
+    "vendor", "venv",
 }
+LOCAL_AUDIT_SOURCE_EXTENSIONS = SOURCE_EXTENSIONS | {
+    ".bash", ".cjs", ".conf", ".html", ".ini", ".js", ".jsx", ".json",
+    ".mjs", ".ps1", ".sh", ".toml", ".ts", ".tsx", ".xml", ".yaml", ".yml",
+}
+LOCAL_AUDIT_PATTERNS = [
+    ("entrypoint", "rest_route", re.compile(r"\bregister_rest_route\s*\(", re.I)),
+    ("entrypoint", "ajax_handler", re.compile(r"\badd_action\s*\(\s*['\"]wp_ajax_(?:nopriv_)?[a-z0-9_]+", re.I)),
+    ("entrypoint", "admin_page", re.compile(r"\badd_(?:menu_page|submenu_page|options_page|theme_page)\s*\(", re.I)),
+    ("entrypoint", "shortcode", re.compile(r"\badd_shortcode\s*\(", re.I)),
+    ("input", "request_source", re.compile(
+        r"\$_(?:GET|POST|REQUEST|COOKIE|FILES)\b|->get_(?:param|json_params)\s*\(", re.I)),
+    ("authorization", "capability_check", re.compile(r"\bcurrent_user_can\s*\(", re.I)),
+    ("csrf", "nonce_check", re.compile(
+        r"\b(?:check_ajax_referer|check_admin_referer|wp_verify_nonce)\s*\(", re.I)),
+    ("database", "wpdb_access", re.compile(r"\$wpdb\s*->\s*(?:query|get_row|get_results|get_var|insert|update|delete)\s*\(", re.I)),
+    ("output", "output_operation", re.compile(r"\b(?:echo|print|printf)\b", re.I)),
+    ("upload", "upload_operation", re.compile(
+        r"\b(?:move_uploaded_file|wp_handle_upload|wp_handle_sideload|wp_upload_bits)\s*\(", re.I)),
+    ("filesystem", "file_operation", re.compile(
+        r"\b(?:file_get_contents|file_put_contents|fopen|readfile|unlink|rename|copy|rmdir)\s*\(", re.I)),
+    ("deserialization", "deserialize_operation", re.compile(r"\bunserialize\s*\(", re.I)),
+    ("execution", "dynamic_execution", re.compile(
+        r"\b(?:eval|exec|shell_exec|system|passthru|proc_open|popen)\s*\(", re.I)),
+    ("workflow", "state_change", re.compile(
+        r"\b(?:update_option|delete_option|wp_delete_post|delete_user_meta|wp_insert_user|wp_update_user)\s*\(", re.I)),
+]
+LOCAL_SECRET_PATTERN = re.compile(
+    r"""(?i)(?:^|[^A-Za-z0-9])"""
+    r"""(?:api[_-]?(?:key|token)|access[_-]?token|client[_-]?secret|password|secret|token|private[_-]?key)"""
+    r"""[^=:\r\n]{0,32}(?:=>|=|:)\s*"""
+    r"""(?:['"](?P<quoted_value>[^'"\r\n]{8,})['"]|(?P<plain_value>[^#\s'"]{8,}))"""
+)
+LOCAL_SECRET_PLACEHOLDERS = (
+    "changeme", "change-me", "example", "dummy", "placeholder",
+    "your-", "your_", "xxxx", "12345678", "test",
+)
+LOCAL_AUDIT_MAX_FILES = 20000
+LOCAL_AUDIT_MAX_INVENTORY_FILES = 50000
+LOCAL_AUDIT_MAX_TOTAL_BYTES = 512 * 1024 * 1024
+LOCAL_AUDIT_OUTPUT_LIMIT = 20 * 1024 * 1024
 
 
 def discover_dependency_manifests(root: Path, out: Path):
@@ -1107,7 +1182,7 @@ def run_dependency_audits(root: Path, out: Path, timeout: int):
                 results.append(result)
                 continue
 
-            arguments = (["audit", "--format=json", "--no-interaction"]
+            arguments = (["audit", "--format=json", "--no-interaction", "--no-plugins"]
                          if ecosystem == "composer" else ["audit", "--json"])
             result["command"] = [ecosystem, *arguments]
             try:
@@ -1213,6 +1288,475 @@ def dependency_audit(args):
     markdown_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
     print(f"Dependency audit complete: {len(manifests)} manifests/lockfiles, "
           f"{len(results)} audit target(s). Report: {markdown_path}")
+
+
+def inventory_local_project(root: Path, out: Path):
+    """Collect bounded source-surface review locations without retaining code snippets."""
+    root = root.resolve()
+    out = out.resolve()
+    extensions = {}
+    file_paths = []
+    file_count = 0
+    file_inventory_truncated = False
+    source_files = []
+    targets = []
+    warnings = []
+    scanned = 0
+    scanned_bytes = 0
+    truncation_reason = None
+
+    for current, directories, filenames in os.walk(root, followlinks=False):
+        current_path = Path(current).resolve()
+        directories[:] = sorted(
+            name for name in directories
+            if name.lower() not in AUDIT_IGNORED_DIRS
+            and not (current_path / name).is_symlink()
+            and (current_path / name).resolve() != out
+            and out not in (current_path / name).resolve().parents
+        )
+        for filename in sorted(filenames):
+            path = Path(current) / filename
+            if path.is_symlink():
+                continue
+            relative = path.relative_to(root).as_posix()
+            file_count += 1
+            if len(file_paths) < LOCAL_AUDIT_MAX_INVENTORY_FILES:
+                file_paths.append(relative)
+            else:
+                file_inventory_truncated = True
+            extension = path.suffix.lower()
+            if (
+                extension not in LOCAL_AUDIT_SOURCE_EXTENSIONS and filename.lower() != ".env"
+            ):
+                continue
+            if scanned >= LOCAL_AUDIT_MAX_FILES:
+                truncation_reason = f"source inventory stopped at {LOCAL_AUDIT_MAX_FILES} files"
+                break
+            scanned += 1
+            extension_key = extension or "<dotfile>"
+            extensions[extension_key] = extensions.get(extension_key, 0) + 1
+            source_files.append(relative)
+            try:
+                file_size = path.stat().st_size
+                if file_size > MAX_FILE_BYTES:
+                    warnings.append({"path": relative, "reason": "file exceeds the 2 MiB scan limit"})
+                    continue
+                if scanned_bytes + file_size > LOCAL_AUDIT_MAX_TOTAL_BYTES:
+                    truncation_reason = (
+                        f"source inventory stopped at the "
+                        f"{LOCAL_AUDIT_MAX_TOTAL_BYTES // 1024**2} MiB byte limit"
+                    )
+                    break
+                scanned_bytes += file_size
+                text = path.read_text(encoding="utf-8", errors="replace")
+            except OSError as exc:
+                warnings.append({"path": relative, "reason": f"could not read file: {exc}"})
+                continue
+
+            for line_number, line in enumerate(text.splitlines(), start=1):
+                for category, kind, pattern in LOCAL_AUDIT_PATTERNS:
+                    if pattern.search(line):
+                        targets.append({
+                            "path": relative,
+                            "line": line_number,
+                            "category": category,
+                            "kind": kind,
+                        })
+                secret_match = LOCAL_SECRET_PATTERN.search(line)
+                if secret_match:
+                    value = (secret_match.group("quoted_value")
+                             or secret_match.group("plain_value")).strip()
+                    lowered = value.casefold()
+                    if not any(marker in lowered for marker in LOCAL_SECRET_PLACEHOLDERS):
+                        targets.append({
+                            "path": relative,
+                            "line": line_number,
+                            "category": "secrets",
+                            "kind": "hardcoded_secret_candidate",
+                        })
+        if truncation_reason:
+            break
+
+    targets.sort(key=lambda item: (item["path"].casefold(), item["line"], item["category"], item["kind"]))
+    if truncation_reason:
+        warnings.append({"reason": truncation_reason})
+    if file_inventory_truncated:
+        warnings.append({
+            "reason": f"file inventory stopped at {LOCAL_AUDIT_MAX_INVENTORY_FILES} paths",
+        })
+    category_counts = {}
+    for target in targets:
+        category_counts[target["category"]] = category_counts.get(target["category"], 0) + 1
+    return {
+        "file_count": file_count,
+        "file_inventory_truncated": file_inventory_truncated,
+        "files": file_paths,
+        "source_file_count": len(source_files),
+        "files_by_extension": dict(sorted(extensions.items())),
+        "review_target_count": len(targets),
+        "review_targets": targets,
+        "category_counts": category_counts,
+        "warnings": warnings,
+        "truncated": truncation_reason is not None,
+    }, source_files
+
+
+def _audit_output_text(value):
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
+    return value or ""
+
+
+def run_local_audit_tool(name: str, executable: str, arguments: list[str], root: Path,
+                         report_root: Path, output_path: Path, timeout: int,
+                         env=None, acceptable_exit_codes=(0,)):
+    """Run one explicitly selected local tool and persist bounded output."""
+    result = {
+        "tool": name,
+        "status": "pending",
+        "command": [name, *arguments],
+    }
+    try:
+        completed = subprocess.run(
+            audit_command(executable, arguments),
+            cwd=root,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            encoding="utf-8",
+            errors="replace",
+            env=env,
+            check=False,
+        )
+        stdout = completed.stdout or ""
+        stderr = completed.stderr or ""
+        result["exit_code"] = completed.returncode
+        result["status"] = "completed" if completed.returncode in acceptable_exit_codes else "nonzero_exit"
+    except subprocess.TimeoutExpired as exc:
+        stdout = _audit_output_text(exc.stdout)
+        stderr = _audit_output_text(exc.stderr)
+        result["status"] = "timed_out"
+        result["error"] = f"Tool exceeded the {timeout}s timeout."
+    except OSError as exc:
+        stdout = ""
+        stderr = ""
+        result["status"] = "failed"
+        result["error"] = str(exc)[:1000]
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    if stdout:
+        clipped = stdout[:LOCAL_AUDIT_OUTPUT_LIMIT]
+        output_path.write_text(clipped, encoding="utf-8")
+        result["output"] = output_path.relative_to(report_root).as_posix()
+        if len(stdout) > len(clipped):
+            result["output_truncated"] = True
+    if stderr:
+        stderr_path = output_path.with_suffix(output_path.suffix + ".stderr.txt")
+        clipped_stderr = stderr[:LOCAL_AUDIT_OUTPUT_LIMIT]
+        stderr_path.write_text(clipped_stderr, encoding="utf-8")
+        result["stderr_output"] = stderr_path.relative_to(report_root).as_posix()
+        result["stderr"] = stderr[-4000:]
+        if len(stderr) > len(clipped_stderr):
+            result["stderr_truncated"] = True
+    return result
+
+
+def local_tool_path(name: str, root: Path):
+    executable = shutil.which(name)
+    if executable:
+        return executable
+    suffixes = (".bat", ".cmd", ".exe", "") if os.name == "nt" else ("",)
+    for directory in (root / "vendor" / "bin", root / "node_modules" / ".bin"):
+        for suffix in suffixes:
+            candidate = directory / f"{name}{suffix}"
+            if candidate.is_file():
+                return str(candidate)
+    return None
+
+
+def local_security_audit(args):
+    root = Path(args.root).resolve()
+    out = Path(args.out).resolve()
+    if not root.is_dir():
+        raise ValueError(f"Audit root is not a directory: {root}")
+    if out == root:
+        raise ValueError("Audit output directory must be separate from the audit root.")
+    report_root = out / "audit"
+    tool_output = report_root / "tool-output"
+    tool_output.mkdir(parents=True, exist_ok=True)
+
+    inventory, source_files = inventory_local_project(root, out)
+    file_paths = inventory.pop("files")
+    inventory_path = report_root / "surface-inventory.json"
+    atomic_json(inventory_path, inventory)
+    file_inventory_path = report_root / "file-inventory.txt"
+    file_inventory_path.write_text(
+        "".join(path + "\n" for path in file_paths),
+        encoding="utf-8",
+    )
+    tool_results = []
+
+    semgrep = shutil.which("semgrep")
+    if semgrep:
+        command = [
+            "scan", "--config", str(LOCAL_RULES), "--json", "--metrics=off", "--quiet",
+            "-j", "1", "--max-target-bytes", str(MAX_FILE_BYTES),
+        ]
+        for directory in sorted(AUDIT_IGNORED_DIRS):
+            command.extend(["--exclude", f"**/{directory}/**"])
+        if out == root or root in out.parents:
+            command.extend(["--exclude", out.relative_to(root).as_posix() + "/**"])
+        command.append(str(root))
+        semgrep_env = dict(os.environ)
+        semgrep_env["SEMGREP_SEND_METRICS"] = "off"
+        semgrep_env["SEMGREP_ENABLE_VERSION_CHECK"] = "0"
+        semgrep_result = run_local_audit_tool(
+            "semgrep", semgrep, command, root, out,
+            tool_output / "semgrep.json", args.timeout, env=semgrep_env,
+            acceptable_exit_codes=(0, 1),
+        )
+        semgrep_path = out / semgrep_result["output"] if semgrep_result.get("output") else None
+        if semgrep_path:
+            try:
+                semgrep_report = json.loads(semgrep_path.read_text(encoding="utf-8"))
+                semgrep_result["finding_count"] = len(semgrep_report.get("results", []))
+                semgrep_result["analysis_errors"] = [
+                    str(item.get("message", item))[:250]
+                    for item in semgrep_report.get("errors", [])[:10]
+                ]
+                if semgrep_result["analysis_errors"]:
+                    semgrep_result["status"] = "completed_with_analysis_errors"
+            except (OSError, json.JSONDecodeError) as exc:
+                semgrep_result["status"] = "invalid_output"
+                semgrep_result["error"] = str(exc)[:1000]
+        tool_results.append(semgrep_result)
+    else:
+        tool_results.append({"tool": "semgrep", "status": "not_installed"})
+
+    manifests = discover_dependency_manifests(root, out)
+    if args.include_dependencies:
+        manifests, executables, dependency_results = run_dependency_audits(root, out, args.timeout)
+        tool_results.extend(dependency_results)
+    else:
+        tool_results.append({"tool": "composer/npm audit", "status": "disabled_by_option"})
+
+    php_present = any(Path(path).suffix.lower() == ".php" for path in source_files)
+    js_present = any(Path(path).suffix.lower() in {".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx"}
+                     for path in source_files)
+
+    if not args.run_project_tools:
+        for name in ("phpcs", "phpstan", "psalm"):
+            tool_results.append({
+                "tool": name,
+                "status": "opt_in_required",
+                "note": "Use --run-project-tools only for code and tool configuration you trust.",
+            })
+    elif php_present:
+        phpcs = local_tool_path("phpcs", root)
+        if not phpcs:
+            tool_results.append({"tool": "phpcs", "status": "not_installed"})
+        else:
+            standards_result = run_local_audit_tool(
+                "phpcs", phpcs, ["-i"], root, out,
+                tool_output / "phpcs-standards.txt", args.timeout,
+            )
+            tool_results.append(standards_result)
+            standards_path = out / standards_result["output"] if standards_result.get("output") else None
+            standards_text = standards_path.read_text(encoding="utf-8", errors="replace") if standards_path else ""
+            installed_standards = set(re.findall(r"[A-Za-z0-9_]+", standards_text))
+            for standard in ("WordPressVIPMinimum", "WordPress"):
+                if standard in installed_standards:
+                    tool_results.append(run_local_audit_tool(
+                        f"phpcs-{standard}", phpcs,
+                        ["--standard=" + standard, "--report=json", str(root)],
+                        root, out, tool_output / f"phpcs-{standard}.json", args.timeout,
+                    ))
+                else:
+                    tool_results.append({
+                        "tool": f"phpcs-{standard}",
+                        "status": "standard_not_installed",
+                    })
+
+        for name, config_names, command in (
+            ("phpstan", ("phpstan.neon", "phpstan.neon.dist"),
+             ["analyse", "--no-progress", "--error-format=json"]),
+            ("psalm", ("psalm.xml", "psalm.xml.dist"),
+             ["--taint-analysis", "--output-format=json"]),
+        ):
+            executable = local_tool_path(name, root)
+            config = next((root / filename for filename in config_names if (root / filename).is_file()), None)
+            if not executable:
+                tool_results.append({"tool": name, "status": "not_installed"})
+            elif config is None:
+                tool_results.append({"tool": name, "status": "skipped_no_project_config"})
+            else:
+                tool_results.append(run_local_audit_tool(
+                    name, executable, command, root, out,
+                    tool_output / f"{name}.json", args.timeout,
+                ))
+    elif args.run_project_tools:
+        for name in ("phpcs", "phpstan", "psalm"):
+            tool_results.append({"tool": name, "status": "not_applicable_no_php"})
+
+    if js_present:
+        retire = local_tool_path("retire", root)
+        if retire:
+            tool_results.append(run_local_audit_tool(
+                "retire", retire, ["--path", str(root), "--outputformat", "json"],
+                root, out, tool_output / "retire.json", args.timeout,
+            ))
+        else:
+            tool_results.append({"tool": "retire", "status": "not_installed"})
+
+    gitleaks = shutil.which("gitleaks")
+    if gitleaks:
+        redacted_report = tool_output / "gitleaks-redacted.json"
+        result = run_local_audit_tool(
+            "gitleaks", gitleaks,
+            ["dir", "--redact", "--report-format", "json", "--report-path",
+             str(redacted_report), str(root)],
+            root, out, tool_output / "gitleaks.log", args.timeout,
+        )
+        if redacted_report.is_file():
+            result["report"] = redacted_report.relative_to(out).as_posix()
+        result["redacted"] = True
+        tool_results.append(result)
+    else:
+        tool_results.append({"tool": "gitleaks", "status": "not_installed"})
+
+    syft = shutil.which("syft")
+    sbom_path = tool_output / "sbom.cyclonedx.json"
+    if syft:
+        result = run_local_audit_tool(
+            "syft", syft, ["dir:" + str(root), "-o", "cyclonedx-json"],
+            root, out, sbom_path, args.timeout,
+        )
+        if result.get("status") == "completed" and sbom_path.is_file():
+            result["sbom_components"] = None
+            try:
+                sbom = json.loads(sbom_path.read_text(encoding="utf-8"))
+                result["sbom_components"] = len(sbom.get("components", []))
+            except (OSError, json.JSONDecodeError):
+                result["status"] = "invalid_output"
+        tool_results.append(result)
+    else:
+        tool_results.append({"tool": "syft", "status": "not_installed"})
+
+    grype = shutil.which("grype")
+    if grype and sbom_path.is_file():
+        grype_env = dict(os.environ)
+        grype_env["GRYPE_DB_AUTO_UPDATE"] = "false"
+        tool_results.append(run_local_audit_tool(
+            "grype", grype, ["sbom:" + str(sbom_path), "-o", "json",
+                             "--check-for-app-update=false"],
+            root, out, tool_output / "grype.json", args.timeout, env=grype_env,
+        ))
+    else:
+        tool_results.append({
+            "tool": "grype",
+            "status": "not_installed" if not grype else "skipped_no_syft_sbom",
+            "note": "Grype is not allowed to download or update its vulnerability database during this audit.",
+        })
+
+    trivy = shutil.which("trivy")
+    if trivy:
+        trivy_result = run_local_audit_tool(
+            "trivy", trivy,
+            ["fs", "--skip-db-update", "--skip-java-db-update", "--format", "json",
+             "--output", str(tool_output / "trivy.json"), str(root)],
+            root, out, tool_output / "trivy.log", args.timeout,
+        )
+        trivy_report = tool_output / "trivy.json"
+        if trivy_report.is_file():
+            trivy_result["report"] = trivy_report.relative_to(out).as_posix()
+        tool_results.append(trivy_result)
+    else:
+        tool_results.append({"tool": "trivy", "status": "not_installed"})
+
+    tool_results.append({
+        "tool": "codeql",
+        "status": "manual_setup_required",
+        "note": "Database creation and query-pack setup are intentionally not run automatically.",
+    })
+    summary = {
+        "scan_type": "local_wordpress_security_audit",
+        "root": str(root),
+        "generated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "scope": "Local source inventory and installed static/dependency tools; plugin code is not executed.",
+        "network_note": (
+            "Composer/npm audit may contact configured registries. Semgrep uses only bundled local rules; "
+            "Grype/Trivy database updates are disabled."
+        ),
+        "inventory": inventory,
+        "inventory_report": inventory_path.relative_to(out).as_posix(),
+        "file_inventory_report": file_inventory_path.relative_to(out).as_posix(),
+        "dependency_manifests": manifests,
+        "tools": tool_results,
+        "manual_review": [
+            "Trace each REST/AJAX/admin handler to its authorization and object-ownership checks.",
+            "Verify every state-changing request has a correctly scoped nonce; a nonce is not authorization.",
+            "Trace request sources through validation to SQL, output, file, upload, deserialization, and execution sinks.",
+            "Review settings, role changes, import/export, and multi-step workflows for required preconditions and replay/race issues.",
+            "Exercise only an authorized local WordPress instance; dynamic testing is not performed by this command.",
+        ],
+    }
+    json_path = report_root / "security-audit.json"
+    markdown_path = report_root / "security-audit.md"
+    atomic_json(json_path, summary)
+    lines = [
+        "# Local WordPress Security Audit",
+        "",
+        f"- Root: `{root}`",
+        f"- Source files inventoried: {inventory['source_file_count']}",
+        f"- Review locations: {inventory['review_target_count']}",
+        "- This is a static triage workflow, not a vulnerability verdict.",
+        "- Phots does not execute plugin code or perform live-site testing.",
+        "- Composer/npm audits may contact configured package registries.",
+        "",
+        "## Source surfaces for manual review",
+        "",
+        f"Inventory JSON: `{summary['inventory_report']}`",
+        f"File list: `{summary['file_inventory_report']}` ({inventory['file_count']} file(s)"
+        + ("; truncated" if inventory["file_inventory_truncated"] else "") + ")",
+    ]
+    for category, count in sorted(inventory["category_counts"].items()):
+        lines.append(f"- **{category}:** {count} location(s)")
+    if inventory["review_targets"]:
+        lines.extend(["", "### Location index", ""])
+        for target in inventory["review_targets"][:200]:
+            lines.append(
+                f"- `{target['path']}:{target['line']}` — {target['category']} / {target['kind']}"
+            )
+        if len(inventory["review_targets"]) > 200:
+            lines.append("- Additional locations are listed in `surface-inventory.json`.")
+    for warning in inventory["warnings"]:
+        lines.append(f"- **Inventory warning:** {warning.get('path', '')} {warning['reason']}")
+    lines.extend(["", "## Dependency manifests", ""])
+    if manifests:
+        lines.extend(
+            f"- `{item['path']}` — {item['ecosystem']} {item['kind']}"
+            for item in manifests
+        )
+    else:
+        lines.append("No Composer/npm manifests or lockfiles were found.")
+    lines.extend(["", "## Tool results", ""])
+    for result in tool_results:
+        lines.append(
+            f"- **{result['tool']}**: `{result['status']}`"
+            + (f" (exit {result['exit_code']})" if "exit_code" in result else "")
+            + (f" — output: `{result['output']}`" if result.get("output") else "")
+            + (f" — {result['note']}" if result.get("note") else "")
+            + (f" — {result['error']}" if result.get("error") else "")
+        )
+    lines.extend(["", "## Manual review and validation", ""])
+    lines.extend(f"- {item}" for item in summary["manual_review"])
+    lines.extend([
+        "",
+        "Use an exit status or a rule match as a prompt to inspect the saved output; neither proves exploitability. "
+        "Missing capability/nonce checks and business-logic defects require handler-level review.",
+    ])
+    markdown_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    print(f"Local security audit complete. Report: {markdown_path}")
 
 
 def safe_extract(data: bytes, dest: Path):
@@ -1733,8 +2277,9 @@ def launch_interactive():
         print("  3  Check for source drift (one-shot, changed versions only)")
         print("  4  Configure optional AI triage")
         print("  5  Audit local Composer/npm dependencies")
+        print("  6  Run local WordPress security-audit workflow")
         print("  Q  Exit")
-        choice = input("\n  Select a mode [1/2/3/Q]: ").strip().lower()
+        choice = input("\n  Select a mode [1/2/3/4/5/6/Q]: ").strip().lower()
         if choice in {"q", "quit", "exit"}:
             return 0
         if choice == "1":
@@ -1837,7 +2382,13 @@ def launch_interactive():
         if choice == "5":
             dependency_audit(argparse.Namespace(root=".", out="output", timeout=300))
             continue
-        print("  Choose 1, 2, 3, 4, 5, or Q.")
+        if choice == "6":
+            local_security_audit(argparse.Namespace(
+                root=".", out="output", timeout=300,
+                include_dependencies=True, run_project_tools=False,
+            ))
+            continue
+        print("  Choose 1, 2, 3, 4, 5, 6, or Q.")
 
 
 def main():
@@ -1923,6 +2474,18 @@ def main():
     p.add_argument("--out", default="output", help="directory for audit reports and tool output")
     p.add_argument("--timeout", type=int, default=300, help="per-tool timeout in seconds")
     p.set_defaults(func=dependency_audit)
+    p = sub.add_parser(
+        "security-audit",
+        help="inventory local code surfaces and run installed static/dependency audit tools",
+    )
+    p.add_argument("--root", default=".", help="local project directory to audit (default: current directory)")
+    p.add_argument("--out", default="output", help="directory for audit reports and tool output")
+    p.add_argument("--timeout", type=int, default=300, help="per-tool timeout in seconds")
+    p.add_argument("--no-dependency-audits", dest="include_dependencies", action="store_false",
+                   help="skip Composer/npm audits, which may contact configured registries")
+    p.add_argument("--run-project-tools", action="store_true",
+                   help="run PHPCS/PHPStan/Psalm using the project's configuration; only for trusted projects")
+    p.set_defaults(func=local_security_audit, include_dependencies=True)
     args = parser.parse_args()
     if getattr(args, "pages", 1) < 1 or getattr(args, "per_page", 1) < 1:
         parser.error("pages and per-page must be positive")
@@ -1942,7 +2505,7 @@ def main():
             parser.error("pages and per-page must be positive")
         if args.min_installs < 0 or args.delay < 0:
             parser.error("min-installs and delay must be non-negative")
-    if args.command == "audit" and args.timeout < 1:
+    if args.command in {"audit", "security-audit"} and args.timeout < 1:
         parser.error("timeout must be positive")
     if getattr(args, "max_files_per_plugin", 1) < 1 or getattr(args, "max_findings_per_plugin", 1) < 1:
         parser.error("scan limits must be positive")

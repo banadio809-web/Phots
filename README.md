@@ -16,9 +16,17 @@ python scanner.py drift --browse popular --pages 2
 python scanner.py stream --ai-triage --workers 1
 python scanner.py ai-setup
 python scanner.py audit --root .
+python scanner.py security-audit --root .
 ```
 
-Running `python scanner.py` with no arguments opens an interactive launcher with continuous stream, existing-catalog scan, and one-shot source-drift modes. Choose stream mode to see the available RAM, CPU count, Semgrep availability, and recommended number of Phots streams before starting.
+Install Phots into the active Python environment to use the short `phots` command from a terminal:
+
+```powershell
+python -m pip install -e .
+phots
+```
+
+`phots` with no arguments opens the existing interactive launcher; it does not start a scan until you choose a mode. `python scanner.py` remains supported and opens the same UI.
 
 All generated files default to the `output/` directory in the current working directory. `--out` can select a different output directory. `stream` defaults to the `popular` feed because the `new` feed commonly contains plugins below the default 25-install threshold. If a chosen feed has no unseen eligible releases, Phots automatically checks `popular` and explains the fallback in the dashboard/report. Completed `(plugin slug, version)` pairs are remembered in `output/phots_stream.sqlite3`; both `stream` and `scan` reuse saved results instead of scanning those versions again. `output/phots-memory.json` shows the last completed plugin, number of remembered versions, and drift-baseline coverage. A new version is a new scan; to re-check an already-scanned version for changed source, run the separate one-shot `drift` mode below.
 
@@ -59,6 +67,53 @@ Downloads and scans share a bounded worker pool of at most four. Plugin source i
 `audit` inventories `composer.json`/`composer.lock`, `package.json`/`package-lock.json`, and `npm-shrinkwrap.json` under the selected root. It skips common dependency/build directories such as `vendor/` and `node_modules/`. It runs `composer audit` or `npm audit` only when the executable is already installed and a matching manifest plus lockfile is present. It never installs dependencies or runs plugin code. These audit commands may contact the package registries configured for Composer/npm; review that before running against projects with private package names.
 
 Reports are written to `output/audit/dependency-audit.md` and `output/audit/dependency-audit.json`; raw tool output is saved under `output/audit/tool-output/`. A nonzero tool exit is reported with its exit code and output path because it may represent vulnerabilities or a tool/registry error.
+
+## Local WordPress security-audit workflow
+
+Use `security-audit` for a repeatable, local-first pass over a plugin you own or are authorized to assess:
+
+```powershell
+python scanner.py security-audit --root C:\path\to\plugin
+# Skip registry-backed dependency lookups:
+python scanner.py security-audit --root C:\path\to\plugin --no-dependency-audits
+# Explicitly opt into project-configured PHP tools:
+python scanner.py security-audit --root C:\path\to\plugin --run-project-tools
+```
+
+The workflow inventories PHP/JS and supported source/configuration files, recording line locations for REST/AJAX/admin entrypoints, request sources, database/file/upload/deserialization/execution sinks, nonce/capability checks, state-changing APIs, and possible hardcoded-secret assignments. Secret values are not copied into the inventory. These are review locations, not proof that a guard is missing or a vulnerability exists.
+
+It uses Phots' bundled Semgrep rules locally with metrics and version checks disabled. It runs Composer/npm audits only for matching manifest/lockfile pairs and installed executables; Composer plugins are disabled, but Composer/npm may still contact configured registries. If installed, Gitleaks is asked to redact its report, Retire.js checks local JavaScript, and Syft can create a CycloneDX SBOM. Grype and Trivy are run only when installed and configured to use cached vulnerability databases rather than update them. Missing tools are reported instead of installed.
+
+PHPCS (WordPress and VIP standards), PHPStan, and Psalm run only when `--run-project-tools` is supplied. They are otherwise listed as opt-in because project-specific analyzer configurations may load bootstrap code. PHPStan/Psalm are run only when their project configuration is present; PHPCS standards run only when installed. CodeQL database creation and live WordPress testing remain manual: database/build configuration can execute project commands, and this workflow does not launch a site, send requests, or perform dynamic tests.
+
+Reports are saved under `output/audit/`: `security-audit.md`, `security-audit.json`, `surface-inventory.json`, `file-inventory.txt`, and per-tool output in `tool-output/`. Common generated/dependency directories are excluded, and inventory limits are disclosed in the report. The report includes a manual review checklist for authorization, nonce/CSRF, data-flow, and workflow logic. Use the existing `audit` command when you only need the Composer/npm dependency audit.
+
+## Kubernetes (manual local scan)
+
+The local-first Kubernetes setup runs one bounded `scan` Job against a supplied catalog. It does not start the continuous stream or an unattended schedule. The Job uses the existing Supabase result persistence and a PVC for source cache, SQLite completion history, and reports. It runs as a non-root user with a read-only container filesystem and explicit CPU, memory, and temporary-storage limits. AI triage remains disabled unless separately configured.
+
+Build and load the image into a local cluster:
+
+```powershell
+docker build -t phots:local .
+kind load docker-image phots:local --name YOUR_KIND_CLUSTER
+# Or, for minikube:
+minikube image load phots:local
+```
+
+Create the namespace and catalog ConfigMap, then copy `.env.k8s.example` to the ignored `.env.k8s` file and fill in the Supabase credentials. Keep that file out of source control:
+
+```powershell
+Copy-Item .env.k8s.example .env.k8s
+kubectl apply -f deployment/kubernetes/base/namespace.yaml
+kubectl create configmap phots-scan-catalog --namespace phots --from-file=catalog.json=output/catalog.json
+kubectl create secret generic phots-supabase --namespace phots --from-env-file=.env.k8s
+kubectl apply -k deployment/kubernetes/base
+```
+
+The cluster needs a default StorageClass capable of provisioning the 10 GiB `ReadWriteOnce` PVC. To rerun, delete the completed Job and create it again. The catalog ConfigMap is limited by Kubernetes' ConfigMap size constraints; use an approved mounted input source for larger catalogs. These scans download plugin archives from WordPress.org and write results to the configured Supabase project, so use only a project and catalog you are authorized to assess. Do not apply database migrations or run Jobs against the active project without checking its configuration first.
+
+`deployment/kubernetes/base/scan-job.yaml` deliberately fixes worker concurrency at one and has no CronJob or stream Deployment. Horizontal or unattended scanning is not part of this local manual setup.
 
 ## Analysis and outputs
 

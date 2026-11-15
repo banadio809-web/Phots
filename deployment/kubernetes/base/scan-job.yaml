@@ -1,0 +1,85 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: phots-scan
+  namespace: phots
+spec:
+  backoffLimit: 0
+  activeDeadlineSeconds: 7200
+  ttlSecondsAfterFinished: 86400
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: phots
+        app.kubernetes.io/component: manual-scan
+    spec:
+      serviceAccountName: phots-scan
+      automountServiceAccountToken: false
+      restartPolicy: Never
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: scanner
+          image: phots:local
+          imagePullPolicy: Never
+          args:
+            - scan
+            - --catalog
+            - /input/catalog.json
+            - --out
+            - /output
+            - --workers
+            - "1"
+            - --supabase
+          env:
+            - name: SUPABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: phots-supabase
+                  key: SUPABASE_URL
+            - name: SUPABASE_SECRET_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: phots-supabase
+                  key: SUPABASE_SECRET_KEY
+          resources:
+            requests:
+              cpu: 500m
+              memory: 2Gi
+              ephemeral-storage: 512Mi
+            limits:
+              cpu: "2"
+              memory: 4Gi
+              ephemeral-storage: 2Gi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+          volumeMounts:
+            - name: input
+              mountPath: /input
+              readOnly: true
+            - name: output
+              mountPath: /output
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: input
+          configMap:
+            name: phots-scan-catalog
+            items:
+              - key: catalog.json
+                path: catalog.json
+        - name: output
+          persistentVolumeClaim:
+            claimName: phots-output
+        - name: tmp
+          emptyDir:
+            sizeLimit: 512Mi

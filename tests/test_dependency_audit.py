@@ -71,6 +71,26 @@ class DependencyAuditTests(unittest.TestCase):
             artifact = output / results[1]["output"]
             self.assertEqual(json.loads(artifact.read_text(encoding="utf-8")), {"advisories": {}})
 
+    def test_composer_audit_disables_project_plugins(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "composer.json").write_text("{}", encoding="utf-8")
+            (root / "composer.lock").write_text("{}", encoding="utf-8")
+            completed = scanner.subprocess.CompletedProcess(
+                args=["composer", "audit"],
+                returncode=0,
+                stdout='{"advisories":[]}',
+                stderr="",
+            )
+            with (
+                mock.patch.object(scanner.shutil, "which", side_effect=lambda name: "composer" if name == "composer" else None),
+                mock.patch.object(scanner.subprocess, "run", return_value=completed) as run,
+            ):
+                scanner.run_dependency_audits(root, root / "output", 30)
+
+            arguments = run.call_args.args[0]
+            self.assertIn("--no-plugins", arguments)
+
 
 if __name__ == "__main__":
     unittest.main()
