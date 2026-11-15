@@ -1,0 +1,423 @@
+rules:
+  - id: wp-sqli-taint
+    languages: [php]
+    mode: taint
+    severity: ERROR
+    message: Request data may reach a WordPress database query without safe parameterization.
+    metadata:
+      category: security
+      confidence: HIGH
+      wp_class: sql_injection
+      technology: [wordpress, php]
+    pattern-sources:
+      - pattern-either:
+          - pattern: $_GET[...]
+          - pattern: $_POST[...]
+          - pattern: $_REQUEST[...]
+    pattern-sanitizers:
+      - pattern: $wpdb->prepare(...)
+      - pattern: esc_sql(...)
+    pattern-sinks:
+      - patterns:
+          - pattern-either:
+              - pattern: $wpdb->query($SQL)
+              - pattern: $wpdb->get_results($SQL)
+              - pattern: $wpdb->get_var($SQL)
+              - pattern: $wpdb->get_row($SQL)
+          - focus-metavariable: $SQL
+
+  - id: wp-xss-output-taint
+    languages: [php]
+    mode: taint
+    severity: WARNING
+    message: Request data may be rendered without context-appropriate WordPress escaping.
+    metadata:
+      category: security
+      confidence: MEDIUM
+      wp_class: stored_xss
+      technology: [wordpress, php]
+    pattern-sources:
+      - pattern-either:
+          - pattern: $_GET[...]
+          - pattern: $_POST[...]
+          - pattern: $_REQUEST[...]
+    pattern-sanitizers:
+      - pattern: esc_html(...)
+      - pattern: esc_attr(...)
+      - pattern: esc_url(...)
+      - pattern: wp_kses(...)
+      - pattern: wp_kses_post(...)
+      - pattern: htmlspecialchars(...)
+    pattern-sinks:
+      - pattern-either:
+          - pattern: echo $X;
+          - pattern: print $X;
+          - pattern: printf(..., $X, ...);
+
+  - id: wp-command-injection-taint
+    languages: [php]
+    mode: taint
+    severity: ERROR
+    message: Request data may reach a PHP command execution function.
+    metadata:
+      category: security
+      confidence: HIGH
+      wp_class: remote_code_execution
+      technology: [wordpress, php]
+    pattern-sources:
+      - pattern-either:
+          - pattern: $_GET[...]
+          - pattern: $_POST[...]
+          - pattern: $_REQUEST[...]
+    pattern-sanitizers:
+      - pattern: escapeshellarg(...)
+      - pattern: escapeshellcmd(...)
+    pattern-sinks:
+      - pattern-either:
+          - pattern: system($CMD)
+          - pattern: exec($CMD)
+          - pattern: shell_exec($CMD)
+          - pattern: passthru($CMD)
+          - pattern: popen($CMD, ...)
+
+  - id: wp-dynamic-include-taint
+    languages: [php]
+    mode: taint
+    severity: ERROR
+    message: Request data may select a PHP include or require path.
+    metadata:
+      category: security
+      confidence: HIGH
+      wp_class: local_file_inclusion
+      technology: [wordpress, php]
+    pattern-sources:
+      - pattern-either:
+          - pattern: $_GET[...]
+          - pattern: $_POST[...]
+          - pattern: $_REQUEST[...]
+    pattern-sinks:
+      - pattern-either:
+          - pattern: include $PATH;
+          - pattern: include_once $PATH;
+          - pattern: require $PATH;
+          - pattern: require_once $PATH;
+
+  - id: wp-arbitrary-php-upload-taint
+    languages: [php]
+    mode: taint
+    severity: WARNING
+    message: Request file data may reach move_uploaded_file; verify whether executable PHP can be written and reached.
+    metadata:
+      category: security
+      confidence: MEDIUM
+      wp_class: arbitrary_php_file_upload
+      technology: [wordpress, php]
+    pattern-sources:
+      - pattern: $_FILES[...]
+    pattern-sinks:
+      - pattern: move_uploaded_file($TEMP, $DEST)
+
+  - id: wp-unserialize-taint
+    languages: [php]
+    mode: taint
+    severity: WARNING
+    message: Request data may reach unserialize; verify a usable gadget and security impact.
+    metadata:
+      category: security
+      confidence: MEDIUM
+      wp_class: remote_code_execution
+      technology: [wordpress, php]
+    pattern-sources:
+      - pattern-either:
+          - pattern: $_GET[...]
+          - pattern: $_POST[...]
+          - pattern: $_REQUEST[...]
+    pattern-sinks:
+      - pattern: unserialize($DATA)
+
+  - id: wp-arbitrary-options-key-taint
+    languages: [php]
+    mode: taint
+    severity: WARNING
+    message: Request data may control the option name passed to update_option; verify capability checks and the option's impact.
+    metadata:
+      category: security
+      confidence: MEDIUM
+      wp_class: arbitrary_options_update
+      technology: [wordpress, php]
+    pattern-sources:
+      - pattern-either:
+          - pattern: $_GET[...]
+          - pattern: $_POST[...]
+          - pattern: $_REQUEST[...]
+    pattern-sinks:
+      - patterns:
+          - pattern: update_option($NAME, ...)
+          - focus-metavariable: $NAME
+
+  - id: wp-user-role-taint
+    languages: [php]
+    mode: taint
+    severity: ERROR
+    message: Request data may influence a WordPress user role assignment; verify authorization and whether admin is reachable.
+    metadata:
+      category: security
+      confidence: MEDIUM
+      wp_class: privilege_escalation_to_admin
+      technology: [wordpress, php]
+    pattern-sources:
+      - pattern-either:
+          - pattern: $_GET[...]
+          - pattern: $_POST[...]
+          - pattern: $_REQUEST[...]
+    pattern-sinks:
+      - pattern-either:
+          - pattern: wp_insert_user($USER_DATA)
+          - pattern: wp_update_user($USER_DATA)
+          - pattern: $USER->set_role($ROLE)
+
+  - id: python-sqli-taint
+    languages: [python]
+    mode: taint
+    severity: ERROR
+    message: Web request data may flow into a SQL string; use driver parameter binding.
+    metadata:
+      category: security
+      confidence: HIGH
+      wp_class: sql_injection
+      technology: [python]
+    pattern-sources:
+      - pattern-either:
+          - pattern: request.args[...]
+          - pattern: request.form[...]
+          - pattern: request.values[...]
+          - pattern: request.GET[...]
+          - pattern: request.POST[...]
+          - pattern: request.query_params[...]
+    pattern-sinks:
+      - patterns:
+          - pattern: $CURSOR.execute($QUERY, ...)
+          - focus-metavariable: $QUERY
+      - patterns:
+          - pattern: $CURSOR.executemany($QUERY, ...)
+          - focus-metavariable: $QUERY
+
+  - id: python-command-injection-taint
+    languages: [python]
+    mode: taint
+    severity: ERROR
+    message: Request data may reach a shell command or shell-enabled subprocess.
+    metadata:
+      category: security
+      confidence: HIGH
+      wp_class: remote_code_execution
+      technology: [python]
+    pattern-sources:
+      - pattern-either:
+          - pattern: request.args[...]
+          - pattern: request.form[...]
+          - pattern: request.values[...]
+          - pattern: request.GET[...]
+          - pattern: request.POST[...]
+          - pattern: request.query_params[...]
+    pattern-sinks:
+      - pattern: os.system($CMD)
+      - patterns:
+          - pattern: subprocess.$FUNC($CMD, ..., shell=True, ...)
+          - metavariable-regex:
+              metavariable: $FUNC
+              regex: "^(run|Popen|call|check_call|check_output)$"
+
+  - id: python-unsafe-deserialization-taint
+    languages: [python]
+    mode: taint
+    severity: WARNING
+    message: Request data may reach an unsafe deserializer; validate type constraints and reachable gadget impact.
+    metadata:
+      category: security
+      confidence: MEDIUM
+      wp_class: php_object_injection_with_gadget
+      technology: [python]
+    pattern-sources:
+      - pattern-either:
+          - pattern: request.args[...]
+          - pattern: request.form[...]
+          - pattern: request.values[...]
+          - pattern: request.get_data(...)
+          - pattern: request.data
+    pattern-sinks:
+      - pattern: pickle.loads($DATA)
+      - pattern: _pickle.loads($DATA)
+      - pattern: yaml.unsafe_load($DATA)
+
+  - id: python-template-xss-taint
+    languages: [python]
+    mode: taint
+    severity: WARNING
+    message: Request data may be interpreted as a template or trusted HTML.
+    metadata:
+      category: security
+      confidence: MEDIUM
+      wp_class: xss_output
+      technology: [python]
+    pattern-sources:
+      - pattern-either:
+          - pattern: request.args[...]
+          - pattern: request.form[...]
+          - pattern: request.values[...]
+          - pattern: request.GET[...]
+          - pattern: request.POST[...]
+    pattern-sinks:
+      - pattern: render_template_string($TEMPLATE, ...)
+      - pattern: markupsafe.Markup($HTML)
+
+  - id: python-path-traversal-taint
+    languages: [python]
+    mode: taint
+    severity: WARNING
+    message: Web request data may reach a file path operation; verify traversal controls and impact.
+    metadata:
+      category: security
+      confidence: MEDIUM
+      wp_class: directory_traversal
+      technology: [python]
+    pattern-sources:
+      - pattern-either:
+          - pattern: request.args[...]
+          - pattern: request.form[...]
+          - pattern: request.values[...]
+          - pattern: request.GET[...]
+          - pattern: request.POST[...]
+    pattern-sinks:
+      - pattern: open($PATH, ...)
+      - pattern: send_file($PATH, ...)
+
+  - id: go-sqli-taint
+    languages: [go]
+    mode: taint
+    severity: ERROR
+    message: HTTP request data may flow into a Go SQL query string; use query parameters.
+    metadata:
+      category: security
+      confidence: HIGH
+      wp_class: sql_injection
+      technology: [go]
+    pattern-sources:
+      - pattern-either:
+          - pattern: $REQ.FormValue(...)
+          - pattern: $REQ.PostFormValue(...)
+          - pattern: $REQ.URL.Query().Get(...)
+    pattern-sinks:
+      - patterns:
+          - pattern-either:
+              - pattern: $DB.Query($QUERY, ...)
+              - pattern: $DB.QueryRow($QUERY, ...)
+              - pattern: $DB.Exec($QUERY, ...)
+              - pattern: $DB.QueryContext(..., $QUERY, ...)
+              - pattern: $DB.ExecContext(..., $QUERY, ...)
+          - focus-metavariable: $QUERY
+
+  - id: go-shell-injection-taint
+    languages: [go]
+    mode: taint
+    severity: ERROR
+    message: HTTP request data may reach a shell interpreter through exec.Command.
+    metadata:
+      category: security
+      confidence: HIGH
+      wp_class: remote_code_execution
+      technology: [go]
+    pattern-sources:
+      - pattern-either:
+          - pattern: $REQ.FormValue(...)
+          - pattern: $REQ.PostFormValue(...)
+          - pattern: $REQ.URL.Query().Get(...)
+    pattern-sinks:
+      - pattern: exec.Command("sh", "-c", $CMD, ...)
+      - pattern: exec.Command("bash", "-c", $CMD, ...)
+      - pattern: exec.CommandContext(..., "sh", "-c", $CMD, ...)
+      - pattern: exec.CommandContext(..., "bash", "-c", $CMD, ...)
+
+  - id: go-path-traversal-taint
+    languages: [go]
+    mode: taint
+    severity: WARNING
+    message: HTTP request data may reach a filesystem path operation; verify traversal constraints and impact.
+    metadata:
+      category: security
+      confidence: MEDIUM
+      wp_class: directory_traversal
+      technology: [go]
+    pattern-sources:
+      - pattern-either:
+          - pattern: $REQ.FormValue(...)
+          - pattern: $REQ.PostFormValue(...)
+          - pattern: $REQ.URL.Query().Get(...)
+    pattern-sinks:
+      - pattern: os.Open($PATH)
+      - pattern: os.ReadFile($PATH)
+      - pattern: os.Remove($PATH)
+      - pattern: os.RemoveAll($PATH)
+
+  - id: rust-sqli-taint
+    languages: [rust]
+    mode: taint
+    severity: ERROR
+    message: Request or environment data may flow into a raw Rust SQL query string.
+    metadata:
+      category: security
+      confidence: MEDIUM
+      wp_class: sql_injection
+      technology: [rust]
+    pattern-sources:
+      - pattern-either:
+          - pattern: $REQ.query_string()
+          - pattern: $REQ.query()
+          - pattern: $REQ.path()
+    pattern-sinks:
+      - patterns:
+          - pattern: sqlx::query($QUERY)
+          - focus-metavariable: $QUERY
+      - patterns:
+          - pattern: diesel::sql_query($QUERY)
+          - focus-metavariable: $QUERY
+
+  - id: rust-shell-injection-taint
+    languages: [rust]
+    mode: taint
+    severity: ERROR
+    message: Dynamic data may flow into a shell command chain; verify sh -c/bash -c and attacker reachability.
+    metadata:
+      category: security
+      confidence: MEDIUM
+      wp_class: remote_code_execution
+      technology: [rust]
+    pattern-sources:
+      - pattern-either:
+          - pattern: $REQ.query_string()
+          - pattern: $REQ.query()
+          - pattern: $REQ.path()
+    pattern-sinks:
+      - pattern: Command::new("sh").arg("-c").arg($CMD)
+      - pattern: Command::new("bash").arg("-c").arg($CMD)
+
+  - id: rust-path-traversal-taint
+    languages: [rust]
+    mode: taint
+    severity: WARNING
+    message: Dynamic data may reach a filesystem path operation; verify traversal constraints and impact.
+    metadata:
+      category: security
+      confidence: MEDIUM
+      wp_class: directory_traversal
+      technology: [rust]
+    pattern-sources:
+      - pattern-either:
+          - pattern: $REQ.query_string()
+          - pattern: $REQ.query()
+          - pattern: $REQ.path()
+    pattern-sinks:
+      - pattern: std::fs::read_to_string($PATH)
+      - pattern: std::fs::read($PATH)
+      - pattern: std::fs::remove_file($PATH)
+      - pattern: File::open($PATH)
