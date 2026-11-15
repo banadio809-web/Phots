@@ -8,6 +8,7 @@ import bisect
 from collections import deque
 import concurrent.futures
 import ctypes
+import getpass
 import os
 import hashlib
 import heapq
@@ -31,7 +32,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from scope_filter import (COMMON_DANGEROUS, HIGH_THREAT, OTHER_IN_SCOPE,
                           evaluate as evaluate_scope)
-from ai_triage import AIConfig, AIMemory, AIReviewer, load_env_file
+from ai_triage import AIConfig, AIMemory, AIReviewer, load_env_file, save_ai_settings
 from supabase_store import SupabaseStore
 
 API = "https://api.wordpress.org/plugins/info/1.2/"
@@ -136,6 +137,21 @@ def make_ai_reviewer(args, db_path: Path):
         print(f"AI triage is unavailable ({exc}); continuing without AI.", file=sys.stderr)
         return None
     return AIReviewer(config, AIMemory(db_path))
+
+
+def configure_ai_interactively():
+    if not sys.stdin.isatty():
+        raise RuntimeError("AI setup requires an interactive terminal.")
+    load_env_file()
+    current = AIConfig()
+    print("Configure optional AI lead triage (OpenAI-compatible endpoint).")
+    base_url = input(f"Base URL [{current.base_url}]: ").strip() or current.base_url
+    model = input(f"Model [{current.model}]: ").strip() or current.model
+    api_key = getpass.getpass("API key (leave blank to keep the current key): ").strip()
+    config = AIConfig(base_url=base_url, model=model, api_key=api_key or None)
+    config.require_configured()
+    saved_path = save_ai_settings(config.base_url, config.model, api_key or None)
+    print(f"AI settings saved to {saved_path}. The API key was not displayed.")
 
 
 def ensure_history_schema(db):
@@ -999,6 +1015,206 @@ def catalog(args):
     print(f"Saved {len(eligible)} plugins above the install threshold to {out / 'catalog.json'}")
 
 
+AUDIT_MANIFESTS = {
+    "composer.json": ("composer", "manifest"),
+    "composer.lock": ("composer", "lockfile"),
+    "package.json": ("npm", "manifest"),
+    "package-lock.json": ("npm", "lockfile"),
+    "npm-shrinkwrap.json": ("npm", "lockfile"),
+}
+AUDIT_IGNORED_DIRS = {
+    ".git", ".next", ".pytest_cache", ".tox", ".venv", "__pycache__",
+    "build", "dist", "node_modules", "vendor", "venv",
+}
+
+
+def discover_dependency_manifests(root: Path, out: Path):
+    """Inventory Composer/npm manifests without descending into dependency trees."""
+    manifests = []
+    root = root.resolve()
+    out = out.resolve()
+    for current, directories, filenames in os.walk(root, followlinks=False):
+        current_path = Path(current).resolve()
+        directories[:] = sorted(
+            name for name in directories
+            if name.lower() not in AUDIT_IGNORED_DIRS
+            and not (
+                root in out.parents
+                and ((current_path / name).resolve() == out
+                     or out in (current_path / name).resolve().parents)
+            )
+        )
+        for filename in sorted(filenames):
+            entry = AUDIT_MANIFESTS.get(filename.lower())
+            if entry is None:
+                continue
+            path = Path(current) / filename
+            manifests.append({
+                "path": path.relative_to(root).as_posix(),
+                "directory": path.parent.relative_to(root).as_posix(),
+                "ecosystem": entry[0],
+                "kind": entry[1],
+                "size_bytes": path.stat().st_size,
+            })
+    manifests.sort(key=lambda item: (item["path"].casefold(), item["path"]))
+    return manifests
+
+
+def audit_command(executable: str, arguments: list[str]):
+    command = [executable, *arguments]
+    if os.name == "nt" and Path(executable).suffix.lower() in {".bat", ".cmd"}:
+        command_line = subprocess.list2cmdline(command)
+        return [os.environ.get("COMSPEC", "cmd.exe"), "/d", "/s", "/c",
+                f'"{command_line}"']
+    return command
+
+
+def run_dependency_audits(root: Path, out: Path, timeout: int):
+    manifests = discover_dependency_manifests(root, out)
+    ecosystems = {
+        ecosystem: {
+            entry["directory"] for entry in manifests
+            if entry["ecosystem"] == ecosystem and entry["kind"] == "lockfile"
+        }
+        for ecosystem in ("composer", "npm")
+    }
+    manifest_directories = {
+        (entry["ecosystem"], entry["directory"])
+        for entry in manifests if entry["kind"] == "manifest"
+    }
+    targets = {
+        ecosystem: sorted(
+            directory for directory in directories
+            if (ecosystem, directory) in manifest_directories
+        )
+        for ecosystem, directories in ecosystems.items()
+    }
+    executables = {name: shutil.which(name) for name in ("composer", "npm")}
+    results = []
+    output_dir = out / "audit" / "tool-output"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    output_index = 0
+
+    for ecosystem in ("composer", "npm"):
+        for directory in targets[ecosystem]:
+            executable = executables[ecosystem]
+            result = {
+                "ecosystem": ecosystem,
+                "directory": directory or ".",
+                "status": "not_installed" if executable is None else "pending",
+            }
+            if executable is None:
+                results.append(result)
+                continue
+
+            arguments = (["audit", "--format=json", "--no-interaction"]
+                         if ecosystem == "composer" else ["audit", "--json"])
+            result["command"] = [ecosystem, *arguments]
+            try:
+                completed = subprocess.run(
+                    audit_command(executable, arguments),
+                    cwd=root / directory,
+                    capture_output=True,
+                    text=True,
+                    timeout=timeout,
+                    encoding="utf-8",
+                    errors="replace",
+                    check=False,
+                )
+                stdout = completed.stdout or ""
+                stderr = completed.stderr or ""
+                result["exit_code"] = completed.returncode
+                result["status"] = "completed" if completed.returncode == 0 else "nonzero_exit"
+                if stderr:
+                    result["stderr"] = stderr[-4000:]
+            except subprocess.TimeoutExpired as exc:
+                stdout = exc.stdout or ""
+                stderr = exc.stderr or ""
+                if isinstance(stdout, bytes):
+                    stdout = stdout.decode("utf-8", errors="replace")
+                if isinstance(stderr, bytes):
+                    stderr = stderr.decode("utf-8", errors="replace")
+                result["status"] = "timed_out"
+                result["error"] = f"Audit exceeded the {timeout}s timeout."
+                if stderr:
+                    result["stderr"] = stderr[-4000:]
+            except OSError as exc:
+                stdout = ""
+                result["status"] = "failed"
+                result["error"] = str(exc)[:1000]
+
+            if stdout:
+                output_index += 1
+                try:
+                    json.loads(stdout)
+                    suffix = ".json"
+                except json.JSONDecodeError:
+                    suffix = ".txt"
+                output_path = output_dir / f"{ecosystem}-{output_index:03d}{suffix}"
+                output_path.write_text(stdout, encoding="utf-8")
+                result["output"] = output_path.relative_to(out).as_posix()
+            results.append(result)
+
+    return manifests, executables, results
+
+
+def dependency_audit(args):
+    root = Path(args.root).resolve()
+    out = Path(args.out).resolve()
+    if not root.is_dir():
+        raise ValueError(f"Audit root is not a directory: {root}")
+    if out == root:
+        raise ValueError("Audit output directory must be separate from the audit root.")
+    out.mkdir(parents=True, exist_ok=True)
+    manifests, executables, results = run_dependency_audits(root, out, args.timeout)
+    summary = {
+        "scan_type": "local_dependency_audit",
+        "root": str(root),
+        "generated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "network_note": "Composer and npm audit may contact configured package registries.",
+        "tools": {name: bool(path) for name, path in executables.items()},
+        "manifests": manifests,
+        "audits": results,
+    }
+    json_path = out / "audit" / "dependency-audit.json"
+    markdown_path = out / "audit" / "dependency-audit.md"
+    json_path.parent.mkdir(parents=True, exist_ok=True)
+    atomic_json(json_path, summary)
+
+    lines = [
+        "# Local Composer/npm Dependency Audit",
+        "",
+        f"- Root: `{root}`",
+        "- This command inventories manifests and runs installed dependency-audit tools only.",
+        "- It does not install dependencies or execute plugin code.",
+        "- Composer/npm audit may contact configured package registries.",
+        "",
+        "## Manifest inventory",
+        "",
+    ]
+    if manifests:
+        for item in manifests:
+            lines.append(f"- `{item['path']}` — {item['ecosystem']} {item['kind']} ({item['size_bytes']} bytes)")
+    else:
+        lines.append("No Composer or npm manifests/lockfiles were found.")
+    lines.extend(["", "## Audit runs", ""])
+    if results:
+        for item in results:
+            lines.append(f"- **{item['ecosystem']}** in `{item['directory']}`: `{item['status']}`"
+                         + (f" (exit {item['exit_code']})" if "exit_code" in item else "")
+                         + (f" — output: `{item['output']}`" if item.get("output") else "")
+                         + (f" — {item['error']}" if item.get("error") else ""))
+    else:
+        lines.append("No matching manifest+lockfile pairs were available to audit.")
+    lines.extend([
+        "",
+        "A nonzero exit can indicate reported vulnerabilities or a tool/registry error; inspect the saved output and stderr before drawing conclusions.",
+    ])
+    markdown_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    print(f"Dependency audit complete: {len(manifests)} manifests/lockfiles, "
+          f"{len(results)} audit target(s). Report: {markdown_path}")
+
+
 def safe_extract(data: bytes, dest: Path):
     if len(data) > MAX_ZIP_BYTES:
         raise ValueError("archive exceeds configured compressed size limit")
@@ -1515,6 +1731,8 @@ def launch_interactive():
         print("  1  Start continuous stream")
         print("  2  Scan an existing catalog")
         print("  3  Check for source drift (one-shot, changed versions only)")
+        print("  4  Configure optional AI triage")
+        print("  5  Audit local Composer/npm dependencies")
         print("  Q  Exit")
         choice = input("\n  Select a mode [1/2/3/Q]: ").strip().lower()
         if choice in {"q", "quit", "exit"}:
@@ -1541,7 +1759,7 @@ def launch_interactive():
             if browse not in {"new", "popular", "recommended", "beta"}:
                 print("  Unknown feed; using popular.")
                 browse = "popular"
-            output = input("  Output directory [Enter = work]: ").strip() or "work"
+            output = input("  Output directory [Enter = output]: ").strip() or "output"
             supabase = input("  Also persist to connected Supabase? [y/N]: ").strip().lower() in {"y", "yes"}
             ai_triage = input("  Enable AI lead triage from your configured endpoint? [y/N]: ").strip().lower() in {"y", "yes"}
             if ai_triage:
@@ -1562,8 +1780,8 @@ def launch_interactive():
             stream(options)
             return 0
         if choice == "2":
-            catalog_path = input("  Catalog JSON path [Enter = work/catalog.json]: ").strip() or "work/catalog.json"
-            output = input("  Output directory [Enter = work]: ").strip() or "work"
+            catalog_path = input("  Catalog JSON path [Enter = output/catalog.json]: ").strip() or "output/catalog.json"
+            output = input("  Output directory [Enter = output]: ").strip() or "output"
             workers_raw = input("  Parallel workers [Enter = 2]: ").strip()
             try:
                 workers = int(workers_raw) if workers_raw else 2
@@ -1581,7 +1799,7 @@ def launch_interactive():
                 except (RuntimeError, ValueError) as exc:
                     print(f"  {exc} Continuing this scan without AI triage.")
                     ai_triage = False
-            options = argparse.Namespace(catalog=catalog_path, review="review.json", workers=workers,
+            options = argparse.Namespace(catalog=catalog_path, review="output/review.json", workers=workers,
                 max_files_per_plugin=5000, max_findings_per_plugin=1000, semgrep_timeout=120,
                 semgrep_auto=False, out=output, supabase=False, ai_triage=ai_triage,
                 ai_base_url=None, ai_model=None, ai_max_findings_per_plugin=50)
@@ -1592,7 +1810,7 @@ def launch_interactive():
             if browse not in {"new", "popular", "recommended", "beta"}:
                 print("  Unknown feed; using popular.")
                 browse = "popular"
-            output = input("  Output directory [Enter = work]: ").strip() or "work"
+            output = input("  Output directory [Enter = output]: ").strip() or "output"
             supabase = input("  Also persist to connected Supabase? [y/N]: ").strip().lower() in {"y", "yes"}
             ai_triage = input("  Enable AI lead triage from your configured endpoint? [y/N]: ").strip().lower() in {"y", "yes"}
             if ai_triage:
@@ -1610,7 +1828,16 @@ def launch_interactive():
                 ai_max_findings_per_plugin=50)
             drift(options)
             return 0
-        print("  Choose 1, 2, 3, or Q.")
+        if choice == "4":
+            try:
+                configure_ai_interactively()
+            except (RuntimeError, ValueError) as exc:
+                print(f"  AI setup failed: {exc}", file=sys.stderr)
+            continue
+        if choice == "5":
+            dependency_audit(argparse.Namespace(root=".", out="output", timeout=300))
+            continue
+        print("  Choose 1, 2, 3, 4, 5, or Q.")
 
 
 def main():
@@ -1624,12 +1851,12 @@ def main():
     p.add_argument("--browse", choices=["popular", "new", "recommended", "beta"], default="popular")
     p.add_argument("--min-installs", type=int, default=25)
     p.add_argument("--delay", type=float, default=1.0)
-    p.add_argument("--out", default="work")
+    p.add_argument("--out", default="output")
     p.add_argument("--supabase", action="store_true", help="persist the catalog to the configured Supabase project")
     p.set_defaults(func=catalog)
     p = sub.add_parser("scan", help="download catalog source and scan it offline")
-    p.add_argument("--catalog", default="work/catalog.json")
-    p.add_argument("--review", default="review.json")
+    p.add_argument("--catalog", default="output/catalog.json")
+    p.add_argument("--review", default="output/review.json")
     p.add_argument("--workers", type=int, default=2)
     p.add_argument("--max-files-per-plugin", type=int, default=5000)
     p.add_argument("--max-findings-per-plugin", type=int, default=1000)
@@ -1641,7 +1868,7 @@ def main():
     p.add_argument("--ai-model", help="model name; may instead be set in PHOTS_AI_MODEL")
     p.add_argument("--ai-max-findings-per-plugin", type=int, default=50,
                    help="maximum AI-reviewed findings per plugin (excess leads remain open)")
-    p.add_argument("--out", default="work")
+    p.add_argument("--out", default="output")
     p.add_argument("--supabase", action="store_true", help="persist this run, its signals, and reviewed scope decisions")
     p.set_defaults(func=run)
     p = sub.add_parser("stream", help="continuously scan newly observed WordPress.org plugin versions")
@@ -1667,7 +1894,7 @@ def main():
     p.add_argument("--report", help="live HTML report path; default: <out>/phots-live-report.html")
     p.add_argument("--log-file", help="append-only live event log; default: <out>/phots-live.log")
     p.add_argument("--handoff-file", help="updated designer handoff snapshot; default: <out>/phots-designer-handoff.md")
-    p.add_argument("--out", default="work", help="directory for source cache, SQLite history, and status")
+    p.add_argument("--out", default="output", help="directory for source cache, SQLite history, and status")
     p.add_argument("--supabase", action="store_true", help="also persist stream catalog and signals to Supabase")
     p.set_defaults(func=stream)
     p = sub.add_parser("drift", help="one-shot fresh-source fingerprint comparison and rescan of changed versions")
@@ -1686,9 +1913,16 @@ def main():
     p.add_argument("--ai-base-url", help="OpenAI-compatible API base URL; may instead be set in PHOTS_AI_BASE_URL")
     p.add_argument("--ai-model", help="model name; may instead be set in PHOTS_AI_MODEL")
     p.add_argument("--ai-max-findings-per-plugin", type=int, default=50)
-    p.add_argument("--out", default="work", help="directory containing Phots history and drift reports")
+    p.add_argument("--out", default="output", help="directory containing Phots history and drift reports")
     p.add_argument("--supabase", action="store_true", help="also persist drift run and findings to Supabase")
     p.set_defaults(func=drift)
+    p = sub.add_parser("ai-setup", help="configure the optional AI lead-triage endpoint")
+    p.set_defaults(func=lambda _args: configure_ai_interactively())
+    p = sub.add_parser("audit", help="inventory local Composer/npm manifests and run installed dependency audits")
+    p.add_argument("--root", default=".", help="project directory to inventory (default: current directory)")
+    p.add_argument("--out", default="output", help="directory for audit reports and tool output")
+    p.add_argument("--timeout", type=int, default=300, help="per-tool timeout in seconds")
+    p.set_defaults(func=dependency_audit)
     args = parser.parse_args()
     if getattr(args, "pages", 1) < 1 or getattr(args, "per_page", 1) < 1:
         parser.error("pages and per-page must be positive")
@@ -1708,6 +1942,8 @@ def main():
             parser.error("pages and per-page must be positive")
         if args.min_installs < 0 or args.delay < 0:
             parser.error("min-installs and delay must be non-negative")
+    if args.command == "audit" and args.timeout < 1:
+        parser.error("timeout must be positive")
     if getattr(args, "max_files_per_plugin", 1) < 1 or getattr(args, "max_findings_per_plugin", 1) < 1:
         parser.error("scan limits must be positive")
     if getattr(args, "semgrep_timeout", 1) < 1:
