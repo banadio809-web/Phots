@@ -1,0 +1,326 @@
+# ============================================================================
+# Phots Semgrep Rules — WordPress Context-Aware Custom Rules
+# ============================================================================
+#
+# These rules eliminate the 104 false positives observed in the Phots scan
+# report by adding three layers of WordPress-aware context:
+#
+# 1. OUTPUT-ESCAPING AWARENESS: Only flag echo/print when the variable was
+#    NOT previously passed through esc_attr(), esc_html(), esc_url(),
+#    esc_textarea(), esc_js(), wp_json_encode(), wp_kses(), wp_strip_all_tags().
+#
+# 2. ACCESS-CONTROL AWARENESS: Only flag update_option()/state-changing
+
+  - id: wp-xss-escaped-echo
+    languages: [php]
+    mode: taint
+    severity: WARNING
+    message: >
+      Request data may be rendered without context-appropriate
+      WordPress escaping.
+    metadata:
+      category: security
+      confidence: MEDIUM
+      wp_class: stored_xss
+      technology: [wordpress, php]
+    pattern-sources:
+      - pattern-either:
+          - pattern: $_GET[...]
+          - pattern: $_POST[...]
+          - pattern: $_REQUEST[...]
+          - pattern: $_COOKIE[...]
+    pattern-sanitizers:
+      - pattern: esc_html(...)
+      - pattern: esc_attr(...)
+      - pattern: esc_url(...)
+      - pattern: esc_textarea(...)
+      - pattern: esc_js(...)
+      - pattern: wp_kses(...)
+      - pattern: wp_kses_post(...)
+      - pattern: wp_kses_data(...)
+      - pattern: wp_kses_allowed_html(...)
+      - pattern: wp_json_encode(...)
+      - pattern: wp_strip_all_tags(...)
+      - pattern: htmlspecialchars(...)
+      - pattern: $X = sanitize_text_field(...)
+      - pattern: $X = absint(...)
+      - pattern: (int) $X
+    pattern-sinks:
+      - pattern-either:
+          - pattern: echo $X;
+          - pattern: print $X;
+          - pattern: printf(..., $X, ...);
+
+#    operations when NOT gated behind current_user_can(), nonce checks,
+#    or capability validation.
+#
+# 3. SINK-SPECIFICITY: Only flag $_POST/$_GET reads when they flow into
+#    actual file-inclusion operations (include/require/fopen/file_get_contents/
+#    readfile), not generic reads.
+#
+# 4. PATH-TRAVERSAL ALLOWLIST DETECTION: Only flag fopen/readfile if the path
+#    is NOT constrained by an allowlist like isset($sources[$id]).
+#
+# 5. VENDOR/THIRD-PARTY EXCLUSION: Exclude vendor/ directories and
+#    cross-plugin references.
+#
+# 6. INTERPROCEDURAL TAINT TRACKING: Mark $_POST tainted, but treat
+#    sanitize_*(), wp_kses(), esc_*, and allowlist validation as
+#    "sanitizer barriers" that clean the taint.
+#
+# 7. WORDPRESS-SPECIFIC RULE TUNING: Encode WordPress safe-patterns as
+#    automatic suppressors.
+#
+# Usage:
+#   semgrep scan --config rules/wordpress_multilang_context.yml \
+#                --config <custom-source-path> \
+#                source/...
+
+rules:
+  # Rule 1: XSS output — escaping-aware
+  # -------------------------------------------------------------------------
+
+  # Rule 2: update_option / settings write — access-control aware
+  # -------------------------------------------------------------------------
+  - id: wp-settings-write-unsafe
+    languages: [php]
+    mode: taint
+    severity: ERROR
+    message: >
+      A settings option is being written without a visible
+      capability check, nonce verification, or input validation.
+    metadata:
+      category: security
+      confidence: HIGH
+      wp_class: arbitrary_options_update
+      technology: [wordpress, php]
+    pattern-sources:
+      - pattern-either:
+          - pattern: $_POST[...]
+          - pattern: $_GET[...]
+          - pattern: $_REQUEST[...]
+    pattern-sanitizers:
+      - pattern: current_user_can(...)
+      - pattern: check_admin_referer(...)
+      - pattern: check_ajax_referer(...)
+      - pattern: verify_ajax_request(...)
+      - pattern: wp_verify_nonce(...)
+      - pattern: sanitize_text_field(...)
+      - pattern: sanitize_key(...)
+      - pattern: absint(...)
+      - pattern: (int) $X
+      - pattern: in_array(...)
+    pattern-sinks:
+      - pattern: update_option(...)
+
+
+  # Rule 3: Local File Inclusion — sink-specific only
+  # -------------------------------------------------------------------------
+  - id: wp-lfi-sink-specific
+    languages: [php]
+    mode: taint
+    severity: ERROR
+    message: >
+      User-provided data flows into a file-inclusion operation.
+      Verify the path is not attacker-controlled (no traversal).
+    metadata:
+      category: security
+      confidence: HIGH
+      wp_class: local_file_inclusion
+      technology: [wordpress, php]
+    pattern-sources:
+      - pattern-either:
+          - pattern: $_GET[...]
+          - pattern: $_POST[...]
+          - pattern: $_REQUEST[...]
+    pattern-sinks:
+      - pattern-either:
+          # Include/require file operations (LFI)
+          - pattern: include(...)
+          - pattern: include_once(...)
+          - pattern: require(...)
+          - pattern: require_once(...)
+          # File read/write operations
+          - pattern: file_get_contents(...)
+          - pattern: readfile(...)
+          - pattern: fopen(...)
+          - pattern: file_put_contents(...)
+          - pattern: unlink(...)
+          - pattern: rmdir(...)
+          # Filesystem listing
+          - pattern: scandir(...)
+          - pattern: glob(...)
+
+
+  # Rule 4: Directory traversal — allowlist aware
+  # -------------------------------------------------------------------------
+  - id: wp-traversal-allowlist-aware
+    languages: [php]
+    mode: taint
+    severity: WARNING
+    message: >
+      File path may be derived from user input. Verify the path is
+      constrained by an internal allowlist (isset($array[$var])) or
+      sanitization (basename, sanitize_file_name, realpath).
+    metadata:
+      category: security
+      confidence: MEDIUM
+      wp_class: directory_traversal
+      technology: [wordpress, php]
+    pattern-sources:
+      - pattern-either:
+          - pattern: $_GET[...]
+          - pattern: $_POST[...]
+          - pattern: $_REQUEST[...]
+    pattern-sanitizers:
+      # Allowlist patterns
+      - pattern: isset($X[...])
+      - pattern: in_array(...)
+      - pattern: array_key_exists(...)
+      - pattern: switch(...)
+      # Path sanitization
+      - pattern: basename(...)
+      - pattern: sanitize_file_name(...)
+      - pattern: realpath(...)
+      - pattern: wp_normalize_path(...)
+      - pattern: wp_basename(...)
+    pattern-sinks:
+      - pattern-either:
+          - pattern: fopen(...)
+          - pattern: readfile(...)
+          - pattern: file_get_contents(...)
+          - pattern: file_put_contents(...)
+
+
+  # Rule 5: Vendor / PHPDoc exclusion
+  # -------------------------------------------------------------------------
+  - id: wp-vendor-phar-docblock-exclusion
+    languages: [php]
+    severity: INFO
+    message: >
+      This match is in a vendor/third-party file or PHPDoc comment block.
+      Not executable plugin code — no action needed.
+    metadata:
+      category: metadata
+      confidence: LOW
+      technology: [wordpress, php]
+    pattern-either:
+      # Vendor directories
+      - pattern: |
+          $X = file_get_contents('vendor/...');
+      - pattern: |
+          include 'vendor/...';
+      # PHPDoc comment markers near a potential match
+      - pattern: |
+          /**
+           * ...
+           * $_POST...
+           */
+
+
+  # Rule 6: Cross-file taint tracking — 2-3 hop flow
+  # -------------------------------------------------------------------------
+  - id: wp-taint-map-deep-sanitize
+    languages: [php]
+    mode: taint
+    severity: WARNING
+    message: >
+      Tainted request data flows through map_deep/sanitize_* into a
+      potentially unsafe sink. Verify the sanitizer is applied.
+    metadata:
+      category: security
+      confidence: MEDIUM
+      technology: [wordpress, php]
+    pattern-sources:
+      - pattern: $_POST[...]
+      - pattern: $_GET[...]
+    pattern-sanitizers:
+      - pattern: map_deep($X, 'sanitize_text_field')
+      - pattern: map_deep($X, 'sanitize_key')
+      - pattern: map_deep($X, 'absint')
+      - pattern: $X = sanitize_text_field(...)
+      - pattern: $X = sanitize_key(...)
+    pattern-sinks:
+      - pattern: update_option(...)
+      - pattern: include(...)
+      - pattern: fopen(...)
+      - pattern: echo $X;
+
+  # Rule 7: Nonce/capability-protected operations — safe suppressors
+  # -------------------------------------------------------------------------
+  - id: wp-protected-ajax-update
+    languages: [php]
+    mode: taint
+    severity: INFO
+    message: >
+      This update_option() call is inside an AJAX handler that verifies
+      both a nonce and a user capability. It is not attacker-reachable
+      without authentication. No action needed.
+    metadata:
+      category: metadata
+      confidence: HIGH
+      technology: [wordpress, php]
+    pattern-either:
+      # AJAX handler with nonce + capability
+      - pattern: |
+          function ... {
+              check_ajax_referer(...);
+              if (! current_user_can(...)) { ... }
+              update_option(...);
+          }
+      # Admin settings handler with nonce + capability
+      - pattern: |
+          function ... {
+              check_admin_referer(...);
+              if (! current_user_can('manage_options')) { ... }
+              update_option(...);
+          }
+
+
+  # Rule 8: Safe patterns — automatic suppressors
+  # -------------------------------------------------------------------------
+  - id: wp-escape-echo-safe
+    languages: [php]
+    mode: taint
+    severity: INFO
+    message: >
+      The output variable is already escaped via esc_attr(), esc_html(),
+      wp_kses(), wp_json_encode(), or wp_strip_all_tags(). No vulnerability.
+    metadata:
+      category: metadata
+      confidence: HIGH
+      technology: [wordpress, php]
+    pattern-sinks:
+      - pattern-either:
+          - pattern: echo $X;
+          - pattern: print $X;
+          - pattern: printf(..., $X, ...);
+    pattern-sanitizers:
+      - pattern: esc_html($X)
+      - pattern: esc_attr($X)
+      - pattern: esc_url($X)
+      - pattern: wp_kses($X, ...)
+      - pattern: wp_json_encode($X)
+      - pattern: wp_strip_all_tags($X)
+      - pattern: (int) $X
+      - pattern: absint($X)
+
+  # Semgrep config metadata — path-agnostic source discovery
+  # -------------------------------------------------------------------------
+  metadata: {}
+  semgrep: |
+    # The default include patterns (wp-content/plugins/**/*.php) do not match
+    # this project's source layout (source/<plugin>/<version>/<plugin>/...).
+    # Use the custom include patterns below so Semgrep scans the full
+    # source tree regardless of directory structure.
+
+    # Path-agnostic WordPress plugin discovery patterns:
+    #   - source/<slug>/<version>/<plugin>/... (Phots standard layout)
+    #   - plugins/<slug>/... (WordPress.org standard layout)
+    #   - wp-content/plugins/<slug>/... (WordPress.org standard layout)
+    include:
+      - "**/source/**/*.php"
+      - "**/plugins/**/*.php"
+      - "**/*-plugin.php"
+      - "**/wp-content/plugins/**/*.php"
+

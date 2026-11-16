@@ -35,6 +35,7 @@ from scope_filter import (COMMON_DANGEROUS, HIGH_THREAT, OTHER_IN_SCOPE,
                           evaluate as evaluate_scope)
 from ai_triage import AIConfig, AIMemory, AIReviewer, load_env_file, save_ai_settings
 from supabase_store import SupabaseStore
+import context_filter
 import wp_fetcher
 
 API = "https://api.wordpress.org/plugins/info/1.2/"
@@ -327,6 +328,7 @@ def write_human_report(out: Path, plugins: list[dict], decisions: list[dict], al
              "## At a glance", "",
              f"- Plugins in this run: **{stream_status.get('scanned', len(plugins)) if stream_status else len(plugins)}**",
              f"- Candidate signals: **{stream_status.get('signal_count', len(decisions)) if stream_status else len(decisions)}**",
+             f"- Context-suppressed leads: **{stream_status.get('context_suppressed', 0) if stream_status else 0}** (auto-cleared false positives)",
              f"- Eligible candidates: **{len(alerts)}** (still require human verification)",
              f"- Download/scan failures: **{failures}**",
              f"- Semgrep unavailable/error runs: **{semgrep_failures}**",
@@ -448,9 +450,7 @@ def write_human_report(out: Path, plugins: list[dict], decisions: list[dict], al
                   f"<p>Showing latest {stream_status.get('report_limit', 250)} signals; complete history is in SQLite.</p></section>")
         page = page.replace("<h1>WordPress Plugin Scan Report</h1>", "<h1>WordPress Plugin Scan Report</h1>" + banner)
     target = html_path or (out / "report.html")
-    temp = target.with_suffix(target.suffix + ".tmp")
-    temp.write_text(page, encoding="utf-8")
-    temp.replace(target)
+    atomic_write_text(target, page)
 
 
 def _cgroup_memory_available_bytes():
@@ -538,10 +538,31 @@ def concurrency_recommendation(max_workers: int, semgrep_enabled: bool):
     return recommended, available_gb, basis
 
 
+def atomic_write_text(path: Path, text: str, attempts: int = 5):
+    """Atomically replace a file, tolerating transient Windows/OneDrive file locks."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+    temp = Path(temp_name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="") as stream:
+            stream.write(text)
+            stream.flush()
+            os.fsync(stream.fileno())
+        for attempt in range(attempts):
+            try:
+                os.replace(temp, path)
+                return
+            except PermissionError:
+                if attempt + 1 == attempts:
+                    raise
+                time.sleep(0.1 * (attempt + 1))
+    finally:
+        temp.unlink(missing_ok=True)
+
+
 def atomic_json(path: Path, value):
-    temp = path.with_suffix(path.suffix + ".tmp")
-    temp.write_text(json.dumps(value, indent=2, ensure_ascii=False), encoding="utf-8")
-    temp.replace(path)
+    atomic_write_text(path, json.dumps(value, indent=2, ensure_ascii=False))
 
 
 class PhotsLiveLog:
@@ -638,10 +659,8 @@ class PhotsLiveLog:
         lines.extend(recent or ["No events recorded yet."])
         lines += ["```", "", "## Interpretation", "",
                   "Automated scan counts and AI dispositions are workflow telemetry, not confirmed vulnerabilities. A quiet period with status `waiting` means the feed returned no unseen eligible versions until the next poll; active worker stages and elapsed times distinguish slow work from idle polling.", ""]
-        temp = self.handoff_path.with_suffix(self.handoff_path.suffix + ".tmp")
         try:
-            temp.write_text("\n".join(lines), encoding="utf-8")
-            temp.replace(self.handoff_path)
+            atomic_write_text(self.handoff_path, "\n".join(lines))
         except OSError:
             pass
 
@@ -803,8 +822,12 @@ def stream(args):
              "log_path": str(log_path), "handoff_path": str(handoff_path),
              "poll_seconds": args.poll_seconds, "scanned": 0, "signal_count": 0,
              "failures": 0, "last_plugin": None, "active": 0, "queued": 0,
-             "semgrep_available": semgrep_enabled}
+             "semgrep_available": semgrep_enabled, "context_suppressed": 0}
     state["ai_enabled"] = bool(ai_reviewer)
+    reviewed_clean_path = Path(getattr(args, "reviewed_clean", "output/reviewed_clean.json"))
+    if not reviewed_clean_path.is_absolute():
+        reviewed_clean_path = out / reviewed_clean_path.name
+    reviewed_clean = context_filter.load_reviewed_clean(reviewed_clean_path)
     if ai_reviewer:
         state["ai_model"] = ai_reviewer.config.model
     store = SupabaseStore() if args.supabase else None
@@ -892,11 +915,15 @@ def stream(args):
         live_log.event("INFO", "heartbeat", status=state["status"], plugins=total_plugins,
                        signals=total_signals, active=state["active"], queued=state["queued"])
         report_out = report_path.parent
-        write_human_report(report_out, plugins, decisions, alerts, state["failures"],
-                           state.get("semgrep_failures", 0), time.monotonic() - started,
-                           stream_status=report_state, html_path=report_path, write_markdown=False)
-        atomic_json(out / "phots-stream-status.json", report_state)
-        write_memory_snapshot(out, db)
+        try:
+            write_human_report(report_out, plugins, decisions, alerts, state["failures"],
+                               state.get("semgrep_failures", 0), time.monotonic() - started,
+                               stream_status=report_state, html_path=report_path, write_markdown=False)
+            atomic_json(out / "phots-stream-status.json", report_state)
+            write_memory_snapshot(out, db)
+        except OSError as exc:
+            state["last_output_error"] = str(exc)[:300]
+            live_log.event("WARN", "report_write_failed", detail=exc)
         live_log.update_handoff(report_state)
         state.update(scanned=total_plugins, signal_count=total_signals)
         if args.tui:
@@ -1025,7 +1052,9 @@ def stream(args):
                             job = pool.submit(download_and_scan, plugin_item, out / "source",
                                               args.max_files_per_plugin, args.max_findings_per_plugin,
                                               args.semgrep_timeout, args.semgrep_auto, progress,
-                                              ai_reviewer, args.ai_max_findings_per_plugin)
+                                              ai_reviewer, args.ai_max_findings_per_plugin,
+                                              context_filter_enabled=args.context_filter,
+                                              reviewed_clean=reviewed_clean)
                             active_futures[job] = plugin_item
                         state["queued"] = len(queue)
                     publish()
@@ -1054,13 +1083,19 @@ def stream(args):
                             jobs.pop(plugin.get("slug"), None)
                             state["queued"] = len(active_futures)
                             try:
-                                slug, found, cached, semgrep_status, source_hash = future.result()
+                                slug, found, cached, semgrep_status, source_hash, suppressed = future.result()
                                 completed_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+                                state["context_suppressed"] = state.get("context_suppressed", 0) + len(suppressed)
                                 meta = {"slug": slug, "version": str(plugin["version"]),
                                         "name": str(plugin.get("name") or slug),
                                         "installs": int(plugin.get("active_installs", 0) or 0)}
                                 save_plugin_completion(db, plugin, found, source_hash, completed_at)
-                                write_memory_snapshot(out, db)
+                                try:
+                                    write_memory_snapshot(out, db)
+                                except OSError as exc:
+                                    state["last_output_error"] = str(exc)[:300]
+                                    live_log.event("WARN", "memory_snapshot_write_failed", plugin=slug,
+                                                   detail=exc)
                                 if store:
                                     try:
                                         store.upsert_catalog([plugin])
@@ -1160,6 +1195,10 @@ def stream(args):
             finish_interrupted_stream_run(store, run_id, state, live_log)
             publish()
         print(f"\nPhots stopped cleanly. Live report: {report_path}")
+    try:
+        context_filter.save_reviewed_clean(reviewed_clean_path, reviewed_clean)
+    except OSError:
+        pass
 
 
 def fetch_bytes(url: str, limit: int, timeout: int):
@@ -2153,14 +2192,18 @@ def semgrep_scan(slug: str, version: str, root: Path, timeout: int, include_auto
 
 def download_and_scan(plugin, source_root: Path, max_files: int, max_findings: int,
                       semgrep_timeout: int, semgrep_auto: bool, progress=None,
-                      ai_reviewer: AIReviewer | None = None, ai_max_findings: int = 50):
+                      ai_reviewer: AIReviewer | None = None, ai_max_findings: int = 50,
+                      context_filter_enabled: bool = True,
+                      reviewed_clean: set[str] | None = None):
     if progress:
         progress("starting", "worker accepted plugin")
     slug, version, path, cached, verification = download_one(plugin, source_root, progress)
     scan_plugin = dict(plugin)
     scan_plugin["version"] = str(verification.get("version_verified") or version)
     result = scan_source_tree(scan_plugin, path, max_files, max_findings, semgrep_timeout,
-                              semgrep_auto, progress, ai_reviewer, ai_max_findings, cached)
+                              semgrep_auto, progress, ai_reviewer, ai_max_findings, cached,
+                              context_filter_enabled=context_filter_enabled,
+                              reviewed_clean=reviewed_clean)
     for finding in result[1]:
         finding["version_api"] = version
         finding["version_source"] = verification.get("version_source", "api")
@@ -2171,7 +2214,9 @@ def download_and_scan(plugin, source_root: Path, max_files: int, max_findings: i
 def scan_source_tree(plugin: dict, path: Path, max_files: int, max_findings: int,
                      semgrep_timeout: int, semgrep_auto: bool, progress=None,
                      ai_reviewer: AIReviewer | None = None, ai_max_findings: int = 50,
-                     cached: bool = False, source_hash: str | None = None):
+                     cached: bool = False, source_hash: str | None = None,
+                     context_filter_enabled: bool = True,
+                     reviewed_clean: set[str] | None = None):
     slug, version = str(plugin["slug"]), str(plugin["version"])
     if source_hash is None:
         source_hash = fingerprint_source(path, max_files)
@@ -2180,6 +2225,23 @@ def scan_source_tree(plugin: dict, path: Path, max_files: int, max_findings: int
     findings = scan_tree(slug, version, path, max_files, heuristic_cap, progress)
     deep_findings, semgrep_status = semgrep_scan(slug, version, path, semgrep_timeout, semgrep_auto, progress)
     findings.extend(deep_findings[:max(0, max_findings - len(findings))])
+
+    # Exclude signals already reviewed as clean (persisted false positives).
+    if reviewed_clean:
+        findings = [f for f in findings if f.get("signal_id") not in reviewed_clean]
+
+    # Context-aware false-positive suppression.
+    suppressed_findings: list[dict] = []
+    if context_filter_enabled and findings:
+        try:
+            suppressed_findings, findings = context_filter.apply_context_filter(findings, path)
+        except Exception as exc:  # never let context filtering abort a scan
+            suppressed_findings = []
+            if progress:
+                progress("context filter", f"context filter skipped ({exc})")
+        if progress:
+            progress("context filter", f"{len(suppressed_findings)} leads suppressed, {len(findings)} kept")
+
     if ai_reviewer and findings:
         if progress:
             progress("AI source triage", f"reviewing up to {ai_max_findings} leads")
@@ -2191,8 +2253,8 @@ def scan_source_tree(plugin: dict, path: Path, max_files: int, max_findings: int
                 "auto_closed": False, "evidence_validated": False,
                 "provider": "openai-compatible"})
     if progress:
-        progress("complete", f"{len(findings)} total signals")
-    return slug, findings, cached, semgrep_status, source_hash
+        progress("complete", f"{len(findings)} signals ({len(suppressed_findings)} context-suppressed)")
+    return slug, findings, cached, semgrep_status, source_hash, suppressed_findings
 
 
 def download_compare_and_scan(plugin: dict, staging_root: Path, previous_hash: str | None,
@@ -2214,7 +2276,7 @@ def download_compare_and_scan(plugin: dict, staging_root: Path, previous_hash: s
                                    semgrep_timeout, semgrep_auto, progress,
                                    ai_reviewer, ai_max_findings, cached=False,
                                    source_hash=current_hash)
-        _, findings, _, semgrep_status, source_hash = scanned
+        _, findings, _, semgrep_status, source_hash, _suppressed = scanned
         for finding in findings:
             finding["version_api"] = api_version
             finding["version_source"] = verification.get("version_source", "api")
@@ -2303,7 +2365,10 @@ def drift(args):
                                      int(plugin.get("active_installs", 0) or 0), *key))
                 else:
                     save_plugin_completion(history, plugin, findings, source_hash, completed_at)
-                    write_memory_snapshot(out, history)
+                    try:
+                        write_memory_snapshot(out, history)
+                    except OSError as exc:
+                        print(f"Warning: could not update memory snapshot: {exc}", file=sys.stderr)
                     changed_plugins.append(plugin)
                     all_findings.extend(findings)
                     if status == "baseline_created":
@@ -2326,7 +2391,10 @@ def drift(args):
                                 "error": str(exc)[:500]})
                 print(f"  drift scan failed · {key[0]} {key[1]}: {exc}", file=sys.stderr)
     history.commit()
-    write_memory_snapshot(out, history)
+    try:
+        write_memory_snapshot(out, history)
+    except OSError as exc:
+        print(f"Warning: could not update memory snapshot: {exc}", file=sys.stderr)
     history.close()
 
     decisions = []
@@ -2446,6 +2514,10 @@ def run(args):
         store.verify()
         store.upsert_catalog(plugins)
         store.start_run(run_id, len(plugins))
+    reviewed_clean_path = Path(getattr(args, "reviewed_clean", "output/reviewed_clean.json"))
+    if not reviewed_clean_path.is_absolute():
+        reviewed_clean_path = out / reviewed_clean_path.name
+    reviewed_clean = context_filter.load_reviewed_clean(reviewed_clean_path)
     source_root = out / "source"
     if not shutil.which("semgrep"):
         print("Semgrep is not installed; only built-in heuristics will run. Install with: python -m pip install semgrep",
@@ -2456,20 +2528,27 @@ def run(args):
     cached_plugins = 0
     failures = 0
     semgrep_failures = 0
+    context_suppressed = 0
     with concurrent.futures.ThreadPoolExecutor(max_workers=args.workers) as pool:
         futures = {pool.submit(download_and_scan, p, source_root,
                                args.max_files_per_plugin, args.max_findings_per_plugin,
                                args.semgrep_timeout, args.semgrep_auto, None, ai_reviewer,
-                               args.ai_max_findings_per_plugin): p for p in to_scan}
+                               args.ai_max_findings_per_plugin,
+                               context_filter_enabled=args.context_filter,
+                               reviewed_clean=reviewed_clean): p for p in to_scan}
         completed = 0
         for future in concurrent.futures.as_completed(futures):
             plugin = futures[future]
             try:
-                slug, plugin_findings, cached, semgrep_status, source_hash = future.result()
+                slug, plugin_findings, cached, semgrep_status, source_hash, suppressed = future.result()
+                context_suppressed += len(suppressed)
                 findings.extend(plugin_findings)
                 cached_plugins += int(cached)
                 save_plugin_completion(history, plugin, plugin_findings, source_hash)
-                write_memory_snapshot(out, history)
+                try:
+                    write_memory_snapshot(out, history)
+                except OSError as exc:
+                    print(f"Warning: could not update memory snapshot: {exc}", file=sys.stderr)
                 if semgrep_status:
                     semgrep_failures += 1
                     if semgrep_failures == 1:
@@ -2483,7 +2562,10 @@ def run(args):
                 print(f"Scanned {completed}/{len(futures)} new plugins; reused {remembered_plugins} from Phots memory; "
                       f"{len(findings)} signals; {completed / elapsed:.2f} plugins/s",
                       file=sys.stderr)
-    write_memory_snapshot(out, history)
+    try:
+        write_memory_snapshot(out, history)
+    except OSError as exc:
+        print(f"Warning: could not update memory snapshot: {exc}", file=sys.stderr)
     history.close()
     for finding in findings:
         finding["review_priority"] = review_priority(finding)["code"]
@@ -2539,10 +2621,15 @@ def run(args):
             except Exception:
                 pass
             raise
-    print(f"Source signals: {len(findings)}; alerts: {len(alerts)}; remembered plugin versions: {remembered_plugins}; "
+    print(f"Source signals: {len(findings)}; alerts: {len(alerts)}; context-suppressed: {context_suppressed}; "
+          f"remembered plugin versions: {remembered_plugins}; "
           f"cached source packages: {cached_plugins}; "
           f"download/scan failures: {failures}; Semgrep plugin-level errors/unavailable runs: {semgrep_failures}; "
           f"elapsed: {elapsed:.1f}s")
+    try:
+        context_filter.save_reviewed_clean(reviewed_clean_path, reviewed_clean)
+    except OSError:
+        pass
 
 
 def launch_interactive():
@@ -2586,6 +2673,12 @@ def choose_discovery_feed():
 
 def _launch_interactive():
     """Friendly no-argument launcher with a hardware-aware Phots stream setup."""
+    # Legacy Windows code pages cannot encode the dashboard's box-drawing characters.
+    if hasattr(sys.stdout, "reconfigure"):
+        try:
+            sys.stdout.reconfigure(errors="replace")
+        except (OSError, ValueError):
+            pass
     if not sys.stdin.isatty():
         print("The Phots interactive launcher needs a terminal. Run `phots --help` to see available commands.",
               file=sys.stderr)
@@ -2637,6 +2730,7 @@ def _launch_interactive():
                 browse=browse, search=search, pages_per_cycle=2, per_page=100, min_installs=25,
                 poll_seconds=60, max_files_per_plugin=5000, max_findings_per_plugin=1000,
                 semgrep_timeout=120, semgrep_auto=False, tui=True, supabase=supabase,
+                context_filter=True, reviewed_clean="output/reviewed_clean.json",
                 ai_triage=ai_triage, ai_base_url=None, ai_model=None,
                 ai_max_findings_per_plugin=50)
             print("\n  Starting Phots. Ctrl+C stops cleanly.\n")
@@ -2737,6 +2831,10 @@ def main():
     p.add_argument("--ai-model", help="model name; may instead be set in PHOTS_AI_MODEL")
     p.add_argument("--ai-max-findings-per-plugin", type=int, default=50,
                    help="maximum AI-reviewed findings per plugin (excess leads remain open)")
+    p.add_argument("--context-filter", action=argparse.BooleanOptionalAction, default=True,
+                   help="enable context-aware false-positive suppression (default: on)")
+    p.add_argument("--reviewed-clean", default="output/reviewed_clean.json",
+                   help="path to persistently store signal IDs reviewed as clean false positives")
     p.add_argument("--out", default="output")
     p.add_argument("--supabase", action="store_true", help="persist this run, its signals, and reviewed scope decisions")
     p.set_defaults(func=run)
@@ -2761,6 +2859,10 @@ def main():
     p.add_argument("--ai-model", help="model name; may instead be set in PHOTS_AI_MODEL")
     p.add_argument("--ai-max-findings-per-plugin", type=int, default=50,
                    help="maximum AI-reviewed findings per plugin (excess leads remain open)")
+    p.add_argument("--context-filter", action=argparse.BooleanOptionalAction, default=True,
+                   help="enable context-aware false-positive suppression (default: on)")
+    p.add_argument("--reviewed-clean", default="output/reviewed_clean.json",
+                   help="path to persistently store signal IDs reviewed as clean false positives")
     p.add_argument("--tui", action=argparse.BooleanOptionalAction, default=sys.stdout.isatty(),
                    help="show the Phots live terminal dashboard (default: on in an interactive terminal)")
     p.add_argument("--report", help="live HTML report path; default: <out>/phots-live-report.html")
@@ -2788,6 +2890,10 @@ def main():
     p.add_argument("--ai-base-url", help="OpenAI-compatible API base URL; may instead be set in PHOTS_AI_BASE_URL")
     p.add_argument("--ai-model", help="model name; may instead be set in PHOTS_AI_MODEL")
     p.add_argument("--ai-max-findings-per-plugin", type=int, default=50)
+    p.add_argument("--context-filter", action=argparse.BooleanOptionalAction, default=True,
+                   help="enable context-aware false-positive suppression (default: on)")
+    p.add_argument("--reviewed-clean", default="output/reviewed_clean.json",
+                   help="path to persistently store signal IDs reviewed as clean false positives")
     p.add_argument("--out", default="output", help="directory containing Phots history and drift reports")
     p.add_argument("--supabase", action="store_true", help="also persist drift run and findings to Supabase")
     p.set_defaults(func=drift)

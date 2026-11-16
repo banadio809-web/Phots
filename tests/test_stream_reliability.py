@@ -10,6 +10,38 @@ import scanner
 
 
 class StreamReliabilityTests(unittest.TestCase):
+    def test_atomic_write_retries_transient_replace_lock_with_unique_temp_file(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            target = Path(temporary) / "phots-memory.json"
+            target.write_text("old", encoding="utf-8")
+            replace = scanner.os.replace
+            calls = 0
+
+            def lock_once(source, destination):
+                nonlocal calls
+                calls += 1
+                if calls == 1:
+                    raise PermissionError("simulated OneDrive lock")
+                return replace(source, destination)
+
+            with mock.patch.object(scanner.os, "replace", side_effect=lock_once), \
+                    mock.patch.object(scanner.time, "sleep"):
+                scanner.atomic_write_text(target, "new")
+
+            self.assertEqual(target.read_text(encoding="utf-8"), "new")
+            self.assertEqual(calls, 2)
+            self.assertEqual(list(Path(temporary).glob("*.tmp")), [])
+
+    def test_atomic_write_cleans_temp_file_after_persistent_permission_error(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            target = Path(temporary) / "phots-memory.json"
+            with mock.patch.object(scanner.os, "replace", side_effect=PermissionError("locked")), \
+                    mock.patch.object(scanner.time, "sleep"):
+                with self.assertRaises(PermissionError):
+                    scanner.atomic_write_text(target, "new", attempts=2)
+            self.assertFalse(target.exists())
+            self.assertEqual(list(Path(temporary).glob("*.tmp")), [])
+
     def test_retry_backoff_only_applies_to_transient_errors(self):
         error = RuntimeError("temporary network problem")
         self.assertEqual(scanner.retry_delay_seconds(1, error), 60)

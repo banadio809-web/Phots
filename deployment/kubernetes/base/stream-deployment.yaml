@@ -36,11 +36,11 @@ spec:
             - --out
             - /state
             - --workers
-            - "1"
+            - "2"
             - --max-workers
             - "2"
             - --poll-seconds
-            - "60"
+            - "30"
             - --no-tui
             - --supabase
           env:
@@ -56,12 +56,12 @@ spec:
                   key: SUPABASE_SECRET_KEY
           resources:
             requests:
-              cpu: "1"
-              memory: 3Gi
-              ephemeral-storage: 1Gi
-            limits:
               cpu: "2"
               memory: 6Gi
+              ephemeral-storage: 1Gi
+            limits:
+              cpu: "4"
+              memory: 8Gi
               ephemeral-storage: 3Gi
           securityContext:
             allowPrivilegeEscalation: false

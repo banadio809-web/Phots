@@ -37,10 +37,14 @@ class KubernetesManifestTests(unittest.TestCase):
         stream = yaml.safe_load((BASE / "stream-deployment.yaml").read_text(encoding="utf-8"))
         scan_container = scan["spec"]["template"]["spec"]["containers"][0]
         stream_container = stream["spec"]["template"]["spec"]["containers"][0]
-        self.assertEqual(scan_container["args"][scan_container["args"].index("--workers") + 1], "2")
-        self.assertEqual(stream_container["args"][stream_container["args"].index("--workers") + 1], "1")
-        self.assertEqual(scan_container["resources"]["requests"]["memory"], "3Gi")
-        self.assertEqual(stream_container["resources"]["requests"]["memory"], "3Gi")
+        self.assertEqual(scan_container["args"][scan_container["args"].index("--workers") + 1], "3")
+        self.assertEqual(stream_container["args"][stream_container["args"].index("--workers") + 1], "2")
+        self.assertEqual(stream_container["args"][stream_container["args"].index("--poll-seconds") + 1], "30")
+        for container in (scan_container, stream_container):
+            self.assertEqual(container["resources"]["requests"]["cpu"], "2")
+            self.assertEqual(container["resources"]["requests"]["memory"], "6Gi")
+            self.assertEqual(container["resources"]["limits"]["cpu"], "4")
+            self.assertEqual(container["resources"]["limits"]["memory"], "8Gi")
 
 
 if __name__ == "__main__":

@@ -20,6 +20,21 @@ class TUITests(unittest.TestCase):
         self.assertIn("interactive launcher needs a terminal", error.getvalue())
         self.assertIn("phots --help", error.getvalue())
 
+    def test_interactive_launcher_enables_replacement_for_legacy_console_encoding(self):
+        stdout = mock.Mock()
+        stdout.reconfigure = mock.Mock()
+        terminal = mock.Mock()
+        terminal.isatty.return_value = False
+        error = io.StringIO()
+        with (
+            mock.patch.object(scanner.sys, "stdout", stdout),
+            mock.patch.object(scanner.sys, "stdin", terminal),
+            redirect_stderr(error),
+        ):
+            result = scanner.launch_interactive()
+        self.assertEqual(result, 2)
+        stdout.reconfigure.assert_called_once_with(errors="replace")
+
     def test_no_argument_launcher_handles_closed_terminal_input(self):
         terminal = mock.Mock()
         terminal.isatty.return_value = True
