@@ -4,3 +4,4 @@ work/
 output/
 __pycache__/
 .env.k8s
+*.egg-info/

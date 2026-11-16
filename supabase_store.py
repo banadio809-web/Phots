@@ -47,7 +47,7 @@ class SupabaseStore:
             raise RuntimeError("SUPABASE_URL must be an HTTPS Supabase project URL.")
 
     def request(self, table: str, method: str = "GET", params: dict | None = None,
-                body=None, prefer: str | None = None):
+                body=None, prefer: str | None = None, timeout: int = 60):
         query = urllib.parse.urlencode(params or {})
         url = f"{self.url}/rest/v1/{table}" + (f"?{query}" if query else "")
         headers = {
@@ -62,7 +62,7 @@ class SupabaseStore:
         payload = None if body is None else json.dumps(body, ensure_ascii=False).encode("utf-8")
         req = urllib.request.Request(url, data=payload, headers=headers, method=method)
         try:
-            with urllib.request.urlopen(req, timeout=60) as response:
+            with urllib.request.urlopen(req, timeout=timeout) as response:
                 return response.read(2 * 1024 * 1024)
         except urllib.error.HTTPError as exc:
             detail = exc.read(2048).decode("utf-8", errors="replace")
@@ -121,7 +121,8 @@ class SupabaseStore:
         self._batched_upsert("wp_scope_reviews", rows, "signal_id")
 
     def finish_run(self, run_id: str, status: str, *, scanned_plugins: int,
-                   failed_plugins: int, signal_count: int, alert_count: int):
+                   failed_plugins: int, signal_count: int, alert_count: int,
+                   timeout: int = 60):
         self.request("wp_scan_runs", "PATCH", params={"id": f"eq.{run_id}"}, body={
             "status": status,
             "completed_at": datetime.now(timezone.utc).isoformat(),
@@ -129,7 +130,7 @@ class SupabaseStore:
             "failed_plugins": failed_plugins,
             "signal_count": signal_count,
             "alert_count": alert_count,
-        }, prefer="return=minimal")
+        }, prefer="return=minimal", timeout=timeout)
 
     def _batched_upsert(self, table: str, rows: list[dict], conflict: str):
         for start in range(0, len(rows), 100):

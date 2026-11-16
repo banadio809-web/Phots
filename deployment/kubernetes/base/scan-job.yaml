@@ -2,7 +2,6 @@ apiVersion: batch/v1
 kind: Job
 metadata:
   name: phots-scan
-  namespace: phots
 spec:
   backoffLimit: 0
   activeDeadlineSeconds: 7200
@@ -26,7 +25,7 @@ spec:
       containers:
         - name: scanner
           image: phots:local
-          imagePullPolicy: Never
+          imagePullPolicy: IfNotPresent
           args:
             - scan
             - --catalog
@@ -34,7 +33,11 @@ spec:
             - --out
             - /output
             - --workers
-            - "1"
+            - "2"
+            - --max-files-per-plugin
+            - "5000"
+            - --max-findings-per-plugin
+            - "1000"
             - --supabase
           env:
             - name: SUPABASE_URL
@@ -49,13 +52,13 @@ spec:
                   key: SUPABASE_SECRET_KEY
           resources:
             requests:
-              cpu: 500m
-              memory: 2Gi
-              ephemeral-storage: 512Mi
+              cpu: "1"
+              memory: 3Gi
+              ephemeral-storage: 1Gi
             limits:
               cpu: "2"
-              memory: 4Gi
-              ephemeral-storage: 2Gi
+              memory: 6Gi
+              ephemeral-storage: 3Gi
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true
@@ -79,7 +82,7 @@ spec:
                 path: catalog.json
         - name: output
           persistentVolumeClaim:
-            claimName: phots-output
+            claimName: phots-scan-output
         - name: tmp
           emptyDir:
-            sizeLimit: 512Mi
+            sizeLimit: 1Gi

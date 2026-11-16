@@ -1,4 +1,5 @@
 import io
+from contextlib import redirect_stderr
 import unittest
 from types import SimpleNamespace
 from unittest import mock
@@ -7,6 +8,33 @@ import scanner
 
 
 class TUITests(unittest.TestCase):
+    def test_no_argument_launcher_explains_terminal_requirement(self):
+        terminal = mock.Mock()
+        terminal.isatty.return_value = False
+        error = io.StringIO()
+
+        with mock.patch.object(scanner.sys, "stdin", terminal), redirect_stderr(error):
+            result = scanner.launch_interactive()
+
+        self.assertEqual(result, 2)
+        self.assertIn("interactive launcher needs a terminal", error.getvalue())
+        self.assertIn("phots --help", error.getvalue())
+
+    def test_no_argument_launcher_handles_closed_terminal_input(self):
+        terminal = mock.Mock()
+        terminal.isatty.return_value = True
+        error = io.StringIO()
+
+        with (
+            mock.patch.object(scanner.sys, "stdin", terminal),
+            mock.patch("builtins.input", side_effect=EOFError),
+            redirect_stderr(error),
+        ):
+            result = scanner.launch_interactive()
+
+        self.assertEqual(result, 2)
+        self.assertIn("No terminal input is available", error.getvalue())
+
     def test_dashboard_explains_controls_and_keeps_recent_leads_visible(self):
         output = io.StringIO()
         terminal = mock.Mock()

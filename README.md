@@ -9,10 +9,11 @@ Python 3.10 or newer. Semgrep Community Edition is strongly recommended for synt
 ## Run
 
 ```powershell
-python scanner.py catalog --pages 2 --per-page 100 --browse popular --min-installs 25
+python scanner.py catalog --pages 2 --per-page 100 --min-installs 25
 python scanner.py scan --catalog output/catalog.json --review output/review.json --workers 2 --supabase
-python scanner.py stream --browse popular --pages-per-cycle 2
-python scanner.py drift --browse popular --pages 2
+python scanner.py stream --pages-per-cycle 2
+python scanner.py drift --pages 2
+python scanner.py catalog --search "image optimization"
 python scanner.py stream --ai-triage --workers 1
 python scanner.py ai-setup
 python scanner.py audit --root .
@@ -28,16 +29,21 @@ phots
 
 `phots` with no arguments opens the existing interactive launcher; it does not start a scan until you choose a mode. `python scanner.py` remains supported and opens the same UI.
 
-All generated files default to the `output/` directory in the current working directory. `--out` can select a different output directory. `stream` defaults to the `popular` feed because the `new` feed commonly contains plugins below the default 25-install threshold. If a chosen feed has no unseen eligible releases, Phots automatically checks `popular` and explains the fallback in the dashboard/report. Completed `(plugin slug, version)` pairs are remembered in `output/phots_stream.sqlite3`; both `stream` and `scan` reuse saved results instead of scanning those versions again. `output/phots-memory.json` shows the last completed plugin, number of remembered versions, and drift-baseline coverage. A new version is a new scan; to re-check an already-scanned version for changed source, run the separate one-shot `drift` mode below.
+If PowerShell says the command is not recognized after installation, open a new terminal; if VS Code still cannot find it, restart VS Code so it reloads the updated PATH.
 
-The stream writes the live browser report to `output/phots-live-report.html` after each completed plugin, refreshes it periodically while work is running, and auto-refreshes the browser view. It also appends operational events to `output/phots-live.log` and refreshes `output/phots-designer-handoff.md` with a current snapshot, diagnostics, and recent events for product/design handoff. The event log rotates at 10 MiB to a `.1` backup. These files omit API keys and code excerpts. Override them with `--log-file` and `--handoff-file`. Add `--supabase` to persist each plugin and its findings to the connected Supabase project as well. In an interactive terminal, Phots displays each worker's current stage and elapsed step time. Press **P** to pause/resume dispatching more plugins and **Q** or **Ctrl+C** to stop cleanly. Existing scans finish before shutdown. The terminal dashboard can be disabled with `--no-tui`. Transient plugin failures get up to three attempts with a cooldown; the live status shows retry information.
+All generated files default to the `output/` directory in the current working directory. `--out` can select a different output directory. Discovery defaults to the **Recently updated** feed, which is a useful ongoing source of releases. Other feeds are `popular`, `new`, `recommended`, `beta`, and `top-rated`; `--search "keywords"` searches WordPress.org by name or description instead of browsing a feed. The interactive launcher explains these choices and offers keyword search. The `new` feed often contains plugins below the default 25-install threshold. If a non-search feed has no unseen eligible releases, Phots automatically checks `popular` and explains the fallback in the dashboard/report; keyword searches do not silently fall back to another feed. Completed `(plugin slug, version)` pairs are remembered in `output/phots_stream.sqlite3`; both `stream` and `scan` reuse saved results instead of scanning those versions again. `output/phots-memory.json` shows the last completed plugin, number of remembered versions, and drift-baseline coverage. A new version is a new scan; to re-check an already-scanned version for changed source, run the separate one-shot `drift` mode below.
+
+The stream writes the live browser report to `output/phots-live-report.html` after each completed plugin, refreshes it periodically while work is running, and auto-refreshes the browser view. It also appends operational events to `output/phots-live.log` and refreshes `output/phots-designer-handoff.md` with a current snapshot, diagnostics, and recent events for product/design handoff. The event log rotates at 10 MiB to a `.1` backup. These files omit API keys and code excerpts. Override them with `--log-file` and `--handoff-file`. Add `--supabase` to persist each plugin and its findings to the connected Supabase project as well. In an interactive terminal, Phots displays each worker's current stage and elapsed step time. Press **P** to pause/resume dispatching more plugins and **Q** or **Ctrl+C** to stop cleanly. Existing scans finish before shutdown. The terminal dashboard can be disabled with `--no-tui`. Transient plugin failures get up to three attempts with a cooldown; deterministic archive-limit or path rejections are reported without retrying in the same run. The live status shows retry information.
+
+With `--supabase`, a stopped stream is recorded as `failed` because the current schema has no distinct stopped state. Remote finalization uses a five-second timeout; if it is interrupted or fails, the local report records a warning and Supabase may still show the run as running.
 
 ### Separate source drift scan
 
 `drift` is a finite scan type, separate from the continuous stream. It reads the selected WordPress.org feed, fetches fresh archives only for versions already present in Phots history, and compares hashes of supported source files (`.php`, `.py`, `.go`, `.rs`). Unchanged versions are skipped. Changed files trigger a fresh static scan, replace the saved findings for that plugin version, and update its fingerprint. Older history without a fingerprint gets one baseline scan the first time `drift` is run. New plugin versions are reported but left for normal stream discovery. Results are written under `output/drift/`, including `phots-drift-report.md`, `report.html`, and `phots-drift-report.json`.
 
 ```powershell
-python scanner.py drift --browse popular --pages 2 --workers 2
+python scanner.py drift --pages 2 --workers 2
+python scanner.py drift --search "image optimization" --pages 2 --workers 2
 ```
 
 Phots samples available physical memory and logical CPU count at startup. With Semgrep installed it budgets 2 GiB per concurrent stream; without Semgrep it budgets 512 MiB. It reserves 35% of currently free memory and selects the lower of memory capacity, CPU count, and `--max-workers` (default cap 10). For example, `--workers 2`, `--workers 3`, `--workers 4`, or `--workers 10` selects that many streams, while the default `--workers 0` uses the recommendation. The dashboard/report show a quick 1/2/3/4/10 fit check. The recommendation is a conservative starting point, not a throughput benchmark; actual best speed depends on disk, network, plugin size, and Semgrep rule downloads. If unsure, start at the recommendation and adjust based on observed throughput and memory.
@@ -58,7 +64,7 @@ Run `python scanner.py ai-setup` (or choose **Configure optional AI triage** in 
 
 Phots sends bounded source windows around findings in batches, plus a few related prior triage summaries. It does not send the whole plugin archive. Local persistent memory is stored in `phots_stream.sqlite3` (`ai_reviews` table): dispositions, confidence, verified code quotes, model name, and summaries; prompts and source windows are not retained. Exact signal IDs are reused from memory after restart. The report shows each disposition and source quote. High-confidence `likely_false_positive` items can be marked **AI closed** only when the quoted text is verified against the source. `likely_bug` means an unconfirmed candidate; static AI review cannot prove exploitability. Missing, malformed, or failed AI responses stay open as `needs_human`. At most 50 new findings per plugin are reviewed by default; excess leads remain open. Raise `--ai-max-findings-per-plugin` to process more, keeping provider cost, rate limits, and review time in mind.
 
-The catalog uses the WordPress.org Plugin Information API. The scan fetches each package, safely extracts it, and analyzes `.php`, `.py`, `.go`, and `.rs` files. Semgrep runs bundled WordPress-specific taint rules by default with metrics disabled. `--semgrep-auto` opts into Semgrep registry auto-rules and enables Semgrep metrics because the CLI requires metrics for auto configuration. Source code remains analyzed locally.
+The catalog uses the WordPress.org Plugin Information API. Package downloads use the bundled [`wp_fetcher.py`](./wp_fetcher.py) library for resumable HTTP Range transfers, ZIP integrity checks, archive-version verification, and safe path/symlink-aware extraction. Partial downloads live under `output/source/.downloads/` and can resume; successful archives are removed after extraction. Phots caps compressed archives at 100 MiB and expanded contents at 500 MiB per plugin. When the archive's verified version differs from the API, findings use the archive version and retain the API version as metadata. The scanner analyzes `.php`, `.py`, `.go`, and `.rs` files. Run `python wp_fetcher.py --help` for the standalone staging interface, which writes to `output/fetcher/` by default. Semgrep runs bundled WordPress-specific taint rules by default with metrics disabled. `--semgrep-auto` opts into Semgrep registry auto-rules and enables Semgrep metrics because the CLI requires metrics for auto configuration. Source code remains analyzed locally.
 
 Downloads and scans share a bounded worker pool of at most four. Plugin source is cached by slug and version. Semgrep has a per-plugin timeout and per-file size cap; the built-in scanner also has per-plugin file and finding limits.
 
@@ -120,13 +126,13 @@ The cluster needs a default StorageClass capable of provisioning the 10 GiB `Rea
 - `output/catalog.json`: selected plugins and WordPress.org metadata.
 - `output/review.json`: optional human review decisions used by `scan`.
 - `output/signals.json`: findings with source language, engine, class hint, code excerpt, and stable `signal_id`.
-- `output/decisions.json`: scope decision (`FAIL`, `REVIEW`, or `PASS`) for each candidate.
+- `output/decisions.json`: scope decision (`FAIL`, `REVIEW`, or `PASS`) plus class-based `review_priority` (`P1`, `P2`, `P3`, or `UNCLASSIFIED`) for each candidate.
 - `output/alerts.json`: candidates that pass Wordfence's filter after human review, sorted with high-threat classes first.
-- `output/report.md`: readable summary grouped by review urgency, with plain-language descriptions and suggested validation steps.
+- `output/report.md`: readable summary with class-based priority and vulnerability-class counts; detailed leads are grouped by priority and show AI/signal status, plain-language descriptions, and validation steps.
 - `output/report.html`: simple browser-friendly version of the same report.
 - `output/source/`: downloaded plugin source.
 
-The report groups signals as “Review first,” “Review,” “Unclassified,” or “Eligible candidate — human review required.” These are workflow buckets, not severity ratings. Every automated signal is explicitly described as unconfirmed, and the report includes the file/line, language, scanner source, scope-filter explanation, and suggested next steps.
+The report includes P1/P2/P3 class-based review priorities alongside AI/signal-status groups. These priorities are not CVSS scores or confirmed vulnerability severities: they use the potential impact suggested by the vulnerability-class hint, and do not establish reachability, exploitability, or real-world impact. Every automated signal remains an unconfirmed lead; the report includes file/line, language, scanner source, scope-filter explanation, and suggested validation steps.
 
 Bundled taint rules cover SQL injection, XSS output, command execution, unsafe deserialization, dynamic PHP includes, file/path operations, arbitrary option changes, user-role assignments, and file uploads. When explicitly enabled with `--semgrep-auto`, Semgrep's auto-selected community rules broaden the language coverage. The code hints only prioritize manual review; the reviewer must establish reachability, permission level, impact, patch status, duplicates, and a safe reproducible proof of concept.
 

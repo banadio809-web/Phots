@@ -12,7 +12,7 @@ requires-python = ">=3.10"
 phots = "scanner:main"
 
 [tool.setuptools]
-py-modules = ["scanner", "scope_filter", "ai_triage", "supabase_store"]
+py-modules = ["scanner", "scope_filter", "ai_triage", "supabase_store", "wp_fetcher"]
 
 [tool.setuptools.data-files]
 "share/phots/rules" = ["rules/wordpress_multilang.yml"]

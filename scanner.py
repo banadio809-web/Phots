@@ -28,7 +28,6 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-import zipfile
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -36,11 +35,17 @@ from scope_filter import (COMMON_DANGEROUS, HIGH_THREAT, OTHER_IN_SCOPE,
                           evaluate as evaluate_scope)
 from ai_triage import AIConfig, AIMemory, AIReviewer, load_env_file, save_ai_settings
 from supabase_store import SupabaseStore
+import wp_fetcher
 
 API = "https://api.wordpress.org/plugins/info/1.2/"
 UA = "WP-Research-Triage/0.1 (polite, read-only source scanner)"
 MAX_ZIP_BYTES = 100 * 1024 * 1024
 MAX_FILE_BYTES = 2 * 1024 * 1024
+
+
+class NonRetryableScanError(ValueError):
+    """A permanent source or configured-limit rejection for the current plugin version."""
+
 
 # These are source review leads, deliberately not vulnerability verdicts.
 RULES = [
@@ -81,6 +86,41 @@ VULN_LABELS = {
     "privilege_escalation_to_admin": "Potential administrator privilege escalation",
     "php_object_injection_with_gadget": "Unsafe object deserialization",
 }
+
+REVIEW_PRIORITY_LABELS = {
+    "P1": "P1 — highest review priority",
+    "P2": "P2 — high review priority",
+    "P3": "P3 — standard review priority",
+    "UNCLASSIFIED": "Unclassified — priority not assigned",
+}
+
+REVIEW_PRIORITY_BASIS = {
+    "P1": "high-impact vulnerability class; confirm reachability and impact",
+    "P2": "potential SQL injection or XSS class; validate the affected context and impact",
+    "P3": "other recognized security class; assess exploitability and context",
+    "UNCLASSIFIED": "no recognized vulnerability class; manually classify the lead",
+}
+
+REVIEW_PRIORITY_P2_CLASSES = COMMON_DANGEROUS | {"xss_output"}
+REVIEW_PRIORITY_P3_CLASSES = OTHER_IN_SCOPE | {"authorization_bypass"}
+
+
+def review_priority(record):
+    """Rank review order by potential impact class, not confirmed vulnerability severity."""
+    hint = record.get("class_hint")
+    scope = record.get("scope_decision") or {}
+    existing_priority = record.get("priority")
+    tier = scope.get("tier_class")
+    if hint in HIGH_THREAT or tier == "high_threat" or existing_priority == "P1_HIGH_THREAT":
+        code = "P1"
+    elif hint in REVIEW_PRIORITY_P2_CLASSES or tier == "common_dangerous" or existing_priority == "P2_COMMON_DANGEROUS":
+        code = "P2"
+    elif hint in REVIEW_PRIORITY_P3_CLASSES or tier == "standard_other" or existing_priority == "P3_STANDARD_OTHER":
+        code = "P3"
+    else:
+        code = "UNCLASSIFIED"
+    return {"code": code, "label": REVIEW_PRIORITY_LABELS[code],
+            "basis": REVIEW_PRIORITY_BASIS[code]}
 
 
 def report_bucket(record):
@@ -250,6 +290,7 @@ def save_plugin_completion(db, plugin: dict, findings: list[dict], source_hash: 
             "vulnerability_type": finding.get("class_hint"), "review_status": "unreviewed",
         }).copy()
         finding["priority"] = "UNCLASSIFIED"
+        finding["review_priority"] = review_priority(finding)["code"]
         db.execute("INSERT OR REPLACE INTO signals VALUES (?,?,?,?,?,?,?)",
                    (finding["signal_id"], slug, version, name, installs,
                     json.dumps(finding, ensure_ascii=False), completed_at))
@@ -267,14 +308,22 @@ def write_human_report(out: Path, plugins: list[dict], decisions: list[dict], al
                        write_markdown: bool = True):
     catalog = {p["slug"]: p for p in plugins}
     buckets = {}
+    priority_buckets = {}
+    class_counts = {}
     for record in decisions:
         buckets.setdefault(report_bucket(record), []).append(record)
+        priority = review_priority(record)
+        record["review_priority"] = priority["code"]
+        priority_buckets.setdefault(priority["code"], []).append(record)
+        class_label = VULN_LABELS.get(record.get("class_hint"), "Unclassified security pattern")
+        class_counts[class_label] = class_counts.get(class_label, 0) + 1
     order = ["AI bug candidate — unconfirmed", "AI review needs human follow-up",
              "AI false-positive suggestion — not closed", "AI review cap — lead remains open", "Review first — stronger automated signal",
              "Review — plausible security lead", "Unclassified — needs manual triage",
              "AI closed as likely false positive", "Eligible candidate — human review required"]
+    priority_order = ["P1", "P2", "P3", "UNCLASSIFIED"]
     lines = ["# WordPress Plugin Scan Report", "",
-             "> Automated source review produces leads, not confirmed vulnerabilities or severity ratings.", "",
+             "> Automated source review produces leads, not confirmed vulnerabilities or severity ratings. Review priorities are class-based triage aids, not CVSS scores or confirmed severity.", "",
              "## At a glance", "",
              f"- Plugins in this run: **{stream_status.get('scanned', len(plugins)) if stream_status else len(plugins)}**",
              f"- Candidate signals: **{stream_status.get('signal_count', len(decisions)) if stream_status else len(decisions)}**",
@@ -282,7 +331,15 @@ def write_human_report(out: Path, plugins: list[dict], decisions: list[dict], al
              f"- Download/scan failures: **{failures}**",
              f"- Semgrep unavailable/error runs: **{semgrep_failures}**",
              f"- Elapsed: **{elapsed:.1f} seconds**", "",
-             "## Review groups", ""]
+             "## Suggested review priority (not vulnerability severity)", ""]
+    for code in priority_order:
+        lines.append(f"- **{REVIEW_PRIORITY_LABELS[code]}:** "
+                     f"{len(priority_buckets.get(code, []))} — {REVIEW_PRIORITY_BASIS[code]}")
+    lines += ["", "## Leads by vulnerability class", ""]
+    lines.extend(f"- **{label}:** {count}" for label, count in sorted(class_counts.items()))
+    if not class_counts:
+        lines.append("No lead categories in this report.")
+    lines += ["", "## Review groups (AI and signal status)", ""]
     ai_counts = {}
     for record in decisions:
         review = record.get("ai_review") or {}
@@ -307,23 +364,29 @@ def write_human_report(out: Path, plugins: list[dict], decisions: list[dict], al
              f"- **Available memory:** {stream_status.get('current_memory_gb', stream_status.get('available_memory_gb', '?'))} GiB now; {stream_status.get('available_memory_gb', '?')} GiB at startup", ""]
         lines.insert(2, f"- **Report window:** latest {stream_status.get('report_limit', 250)} signals; full history is in SQLite")
         stream_status["report_buckets"] = {name: len(buckets.get(name, [])) for name in order}
+        stream_status["priority_buckets"] = {code: len(priority_buckets.get(code, []))
+                                             for code in priority_order}
+        stream_status["class_buckets"] = class_counts
     for bucket in order:
         lines.append(f"- **{bucket}:** {len(buckets.get(bucket, []))}")
     if not decisions:
         lines += ["", "No candidate signals were found in the scanned source. This does not prove the plugins are free of vulnerabilities."]
-    for bucket in order:
-        records = buckets.get(bucket, [])
+    for code in priority_order:
+        records = priority_buckets.get(code, [])
         if not records:
             continue
-        lines += ["", f"## {bucket}", ""]
+        lines += ["", f"## {REVIEW_PRIORITY_LABELS[code]}", "",
+                  REVIEW_PRIORITY_BASIS[code], ""]
         for index, item in enumerate(records, 1):
             meta = catalog.get(item["plugin_slug"], {})
             display = meta.get("name") or item["plugin_slug"]
             decision = item.get("scope_decision", {})
+            priority = review_priority(item)
             scope = decision.get("decision", "REVIEW")
             why = "; ".join(decision.get("reasons", [])) or "Required eligibility evidence has not been reviewed."
             lines += [f"### {index}. {display} ({item['plugin_slug']})",
                       f"- **What was flagged:** {VULN_LABELS.get(item.get('class_hint'), 'Unclassified security pattern')}",
+                      f"- **Suggested review priority:** {priority['label']} — {priority['basis']}",
                       f"- **AI review:** {ai_disposition_label(item)}",
                       f"- **AI evidence:** {ai_evidence_label(item)}",
                       f"- **Where:** `{item.get('file', '?')}:{item.get('line', '?')}` ({item.get('language', '?')})",
@@ -338,13 +401,17 @@ def write_human_report(out: Path, plugins: list[dict], decisions: list[dict], al
 
     # A lightweight HTML view makes the same report scannable in a browser.
     cards = []
-    for bucket in order:
-        for item in buckets.get(bucket, []):
+    for code in priority_order:
+        for item in priority_buckets.get(code, []):
             decision = item.get("scope_decision", {})
             meta = catalog.get(item["plugin_slug"], {})
+            priority = review_priority(item)
             cards.append(f"<article><h2>{html.escape(str(meta.get('name') or item['plugin_slug']))}</h2>"
-                         f"<p><b>{html.escape(bucket)}</b> · {html.escape(str(decision.get('decision', 'REVIEW')))} · "
+                         f"<p><b>{html.escape(priority['label'])}</b> · "
+                         f"{html.escape(report_bucket(item))} · {html.escape(str(decision.get('decision', 'REVIEW')))} · "
                          f"{html.escape(VULN_LABELS.get(item.get('class_hint'), 'Unclassified security pattern'))}</p>"
+                         f"<p><b>Suggested review priority:</b> {html.escape(priority['label'])} — "
+                         f"{html.escape(priority['basis'])}</p>"
                          f"<p><b>AI:</b> {html.escape(ai_disposition_label(item))}</p>"
                          f"<p><b>AI evidence:</b> {html.escape(ai_evidence_label(item))}</p>"
                          f"<p>{html.escape(plain_explanation(item))}</p>"
@@ -357,8 +424,13 @@ def write_human_report(out: Path, plugins: list[dict], decisions: list[dict], al
             "article{background:white;padding:1rem 1.25rem;margin:1rem 0;border-radius:12px;border:1px solid #dce3ef}"
             "pre{white-space:pre-wrap;overflow-wrap:anywhere;background:#f1f4f8;padding:.8rem;border-radius:8px}"
             ".note{background:#fff5d6;padding:1rem;border-radius:8px}</style>"
-            "<h1>WordPress Plugin Scan Report</h1><p class='note'>Automated leads only; not confirmed vulnerabilities or severity ratings.</p>"
+            "<h1>WordPress Plugin Scan Report</h1><p class='note'>Automated leads only; not confirmed vulnerabilities or severity ratings. Review priorities are class-based triage aids, not CVSS scores.</p>"
             f"<p>{stream_status.get('scanned', len(plugins)) if stream_status else len(plugins)} plugins · {stream_status.get('signal_count', len(decisions)) if stream_status else len(decisions)} signals · {len(alerts)} eligible candidates pending human verification · {failures} scan failures</p>"
+            + "".join(f"<p><b>{html.escape(REVIEW_PRIORITY_LABELS[code])}:</b> {len(priority_buckets.get(code, []))}</p>"
+                      for code in priority_order)
+            + "<h2>Leads by vulnerability class</h2>"
+            + "".join(f"<p><b>{html.escape(label)}:</b> {count}</p>"
+                      for label, count in sorted(class_counts.items()))
             + "".join(f"<p><b>{html.escape(name)}:</b> {len(buckets.get(name, []))}</p>" for name in order)
             + "".join(cards))
     if stream_status:
@@ -381,8 +453,31 @@ def write_human_report(out: Path, plugins: list[dict], decisions: list[dict], al
     temp.replace(target)
 
 
+def _cgroup_memory_available_bytes():
+    """Return cgroup-v1/v2 memory headroom, or None when not running in a limited cgroup."""
+    candidates = [
+        (Path("/sys/fs/cgroup/memory.max"), Path("/sys/fs/cgroup/memory.current")),
+        (Path("/sys/fs/cgroup/memory/memory.limit_in_bytes"),
+         Path("/sys/fs/cgroup/memory/memory.usage_in_bytes")),
+    ]
+    for limit_path, usage_path in candidates:
+        try:
+            limit_text = limit_path.read_text(encoding="ascii").strip()
+            if limit_text == "max":
+                continue
+            limit, usage = int(limit_text), int(usage_path.read_text(encoding="ascii").strip())
+            # cgroup v1 represents an unlimited limit as a very large sentinel.
+            if limit > 1 << 60:
+                continue
+            return max(0, limit - usage)
+        except (OSError, ValueError):
+            continue
+    return None
+
+
 def memory_available_bytes():
-    """Return currently available physical memory without an optional dependency."""
+    """Return usable memory, respecting a Linux container's cgroup limit."""
+    available = None
     if os.name == "nt":
         class MEMORYSTATUSEX(ctypes.Structure):
             _fields_ = [("dwLength", ctypes.c_ulong), ("dwMemoryLoad", ctypes.c_ulong),
@@ -393,18 +488,47 @@ def memory_available_bytes():
         state = MEMORYSTATUSEX()
         state.dwLength = ctypes.sizeof(state)
         if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(state)):
-            return int(state.ullAvailPhys)
-    try:
-        pages = os.sysconf("SC_AVPHYS_PAGES")
-        page_size = os.sysconf("SC_PAGE_SIZE")
-        return int(pages * page_size)
-    except (ValueError, OSError, AttributeError):
-        return None
+            available = int(state.ullAvailPhys)
+    else:
+        try:
+            pages = os.sysconf("SC_AVPHYS_PAGES")
+            page_size = os.sysconf("SC_PAGE_SIZE")
+            available = int(pages * page_size)
+        except (ValueError, OSError, AttributeError):
+            pass
+    cgroup_available = _cgroup_memory_available_bytes()
+    if cgroup_available is not None:
+        available = min(available, cgroup_available) if available is not None else cgroup_available
+    return available
+
+
+def available_cpu_count():
+    """Return a CPU count bounded by Linux cgroup quota where available."""
+    cores = max(1, os.cpu_count() or 1)
+    for quota_path, period_path in (
+        (Path("/sys/fs/cgroup/cpu.max"), None),
+        (Path("/sys/fs/cgroup/cpu/cpu.cfs_quota_us"), Path("/sys/fs/cgroup/cpu/cpu.cfs_period_us")),
+    ):
+        try:
+            if period_path is None:
+                quota, period = quota_path.read_text(encoding="ascii").split()[:2]
+                if quota == "max":
+                    continue
+                quota, period = int(quota), int(period)
+            else:
+                quota, period = int(quota_path.read_text(encoding="ascii").strip()), int(
+                    period_path.read_text(encoding="ascii").strip())
+            if quota > 0 and period > 0:
+                cores = min(cores, max(1, quota // period))
+        except (OSError, ValueError):
+            continue
+        break
+    return cores
 
 
 def concurrency_recommendation(max_workers: int, semgrep_enabled: bool):
     available = memory_available_bytes()
-    cores = max(1, os.cpu_count() or 1)
+    cores = available_cpu_count()
     # Reserve 35% of current free RAM for the OS and unrelated applications.
     per_worker = 2 * 1024**3 if semgrep_enabled else 512 * 1024**2
     memory_slots = max(1, int((available * 0.65) // per_worker)) if available else 1
@@ -467,7 +591,11 @@ class PhotsLiveLog:
     def update_handoff(self, state: dict):
         notes = []
         if state.get("workers", 0) > state.get("recommended", 0):
-            notes.append(f"Resource pressure risk: {state['workers']} streams are active, above the RAM-based recommendation of {state['recommended']}.")
+            notes.append(
+                f"Configured concurrency is {state['workers']} streams, above the RAM-based "
+                f"recommendation of {state['recommended']}; currently {state.get('active', 0)} "
+                f"active and {state.get('queued', 0)} queued. More concurrent work may increase peak RAM use."
+            )
         if state.get("active", 0) == 0 and state.get("queued", 0) == 0 and "waiting" in str(state.get("status", "")):
             notes.append("Idle is expected only while polling the catalog; check the feed note and next-poll countdown if no plugins are found.")
         if state.get("semgrep_failures", 0):
@@ -581,8 +709,10 @@ def draw_phots_tui(state: dict, recent: list[dict], *, paused: bool = False):
     activity = state.get("job_lines") or ["Waiting for the next catalog check."]
     body.extend(box("CURRENT ACTIVITY", activity[:4], cyan))
     body.extend(box("SYSTEM & OUTPUT", [
+        f"Discovery: {state.get('discovery_feed', 'WordPress.org')}",
         f"Free RAM: {state.get('current_memory_gb', state.get('available_memory_gb', 'unknown'))} GiB  ·  "
-        f"Recommended workers: {state.get('recommended', 1)}/{state.get('max_workers', 10)}",
+        f"Configured/recommended workers: {workers}/{state.get('recommended', 1)} "
+        f"(max {state.get('max_workers', 10)})",
         f"Feed poll: every {state.get('poll_seconds', 30)}s  ·  Output: {state.get('report_path', 'output/phots-live-report.html')}",
     ], blue))
     body.extend(box("LATEST SIGNALS · leads, not confirmed bugs", findings, yellow))
@@ -608,6 +738,31 @@ def key_pressed():
         return sys.stdin.read(1).lower() if ready else None
     except (OSError, ValueError):
         return None
+
+
+def retry_delay_seconds(attempt: int, error: Exception):
+    if isinstance(error, NonRetryableScanError) or attempt >= 3:
+        return None
+    return min(60 * (2 ** max(0, attempt - 1)), 600)
+
+
+def finish_interrupted_stream_run(store, run_id: str, state: dict, live_log):
+    try:
+        store.finish_run(
+            run_id, "failed", scanned_plugins=state["scanned"],
+            failed_plugins=state["failures"], signal_count=state["signal_count"],
+            alert_count=0, timeout=5,
+        )
+    except KeyboardInterrupt:
+        message = "Supabase stop update was interrupted; the remote run may remain marked running."
+        state["supabase_error"] = message
+        live_log.event("WARN", "supabase_stop_update_interrupted")
+        print(f"Warning: {message}", file=sys.stderr)
+    except Exception as exc:
+        message = f"Supabase could not record the interrupted run: {exc}"[:300]
+        state["supabase_error"] = message
+        live_log.event("ERROR", "supabase_stop_update_failed", detail=exc)
+        print(f"Warning: {message}", file=sys.stderr)
 
 
 def stream(args):
@@ -638,9 +793,12 @@ def stream(args):
     option_fit = ", ".join(f"{n}: {'within recommendation' if n <= recommended else 'above recommendation'}"
                            for n in (1, 2, 3, 4, 10))
     now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    search = (getattr(args, "search", None) or "").strip() or None
+    selected_feed = feed_label(args.browse, search)
     state = {"started_at": now, "status": "running", "workers": workers,
              "recommended": recommended, "available_memory_gb": available_gb,
              "recommendation": basis, "stream_options": option_fit,
+             "discovery_feed": selected_feed,
              "max_workers": max_workers, "report_path": str(report_path),
              "log_path": str(log_path), "handoff_path": str(handoff_path),
              "poll_seconds": args.poll_seconds, "scanned": 0, "signal_count": 0,
@@ -686,7 +844,9 @@ def stream(args):
             activity = f"{slug}: {job['phase']} — {job.get('detail', '')} ({age}s in this step)"
             job_lines.append(activity)
             active_lines.append(activity)
-        state["job_lines"] = job_lines[-workers:] or ["Workers are idle; checking for new plugin versions."]
+        state["job_lines"] = job_lines[-workers:] or [
+            f"Workers are idle; checking {state.get('discovery_feed', 'WordPress.org')}."
+        ]
         state["active_jobs"] = active_lines[-workers:]
 
     def publish(latest_plugin=None):
@@ -752,7 +912,8 @@ def stream(args):
     last_report_at = time.monotonic()
     last_console_heartbeat = time.monotonic()
     live_log.event("INFO", "stream_started", workers=workers, recommended=recommended,
-                   free_ram_gib=available_gb, cpu_cores=os.cpu_count(), feed=args.browse,
+                   free_ram_gib=available_gb, cpu_cores=os.cpu_count(),
+                   feed=args.browse, search=search,
                    min_installs=args.min_installs, semgrep=semgrep_enabled,
                    ai_enabled=bool(ai_reviewer), ai_model=(ai_reviewer.config.model if ai_reviewer else None),
                    supabase=bool(store), report=report_path)
@@ -762,11 +923,9 @@ def stream(args):
             while True:
                 # Discover a bounded batch; versions already persisted in SQLite are skipped on restart.
                 discovered = []
-                feed_used = args.browse
+                feed_used = selected_feed
                 for page in range(1, args.pages_per_cycle + 1):
-                    params = {"action": "query_plugins", "request[browse]": args.browse,
-                              "request[per_page]": str(args.per_page), "request[page]": str(page),
-                              "request[fields][active_installs]": "1"}
+                    params = plugin_query_params(args.browse, page, args.per_page, search)
                     state["status"] = f"checking WordPress.org catalog page {page}/{args.pages_per_cycle}"
                     catalog_future = pool.submit(get_json, api_url(params))
                     try:
@@ -790,11 +949,11 @@ def stream(args):
                     except Exception as exc:
                         last_error = str(exc)[:300]
                         state["last_error"] = last_error
-                        live_log.event("ERROR", "catalog_request_failed", feed=args.browse,
+                        live_log.event("ERROR", "catalog_request_failed", feed=selected_feed,
                                        page=page, detail=last_error)
                         break
                     discovered.extend(data.get("plugins", []))
-                    live_log.event("INFO", "catalog_page", feed=args.browse, page=page,
+                    live_log.event("INFO", "catalog_page", feed=selected_feed, page=page,
                                    entries=len(data.get("plugins", [])))
                     if len(data.get("plugins", [])) < args.per_page:
                         break
@@ -808,7 +967,7 @@ def stream(args):
                         continue
                     seen_this_session.add(key)
                     batch.append(p)
-                if not batch and args.browse != "popular":
+                if not batch and args.browse != "popular" and not search:
                     feed_used = "popular"
                     state["status"] = f"no unseen eligible plugins in '{args.browse}' feed; checking popular feed"
                     state["scan_note"] = (f"The '{args.browse}' feed returned {len(discovered)} entries, but none met "
@@ -819,9 +978,7 @@ def stream(args):
                     publish()
                     discovered = []
                     for page in range(1, args.pages_per_cycle + 1):
-                        params = {"action": "query_plugins", "request[browse]": "popular",
-                                  "request[per_page]": str(args.per_page), "request[page]": str(page),
-                                  "request[fields][active_installs]": "1"}
+                        params = plugin_query_params("popular", page, args.per_page)
                         state["status"] = f"fallback: checking popular catalog page {page}/{args.pages_per_cycle}"
                         catalog_future = pool.submit(get_json, api_url(params))
                         while True:
@@ -939,13 +1096,21 @@ def stream(args):
                                 live_log.event("ERROR", "plugin_failed", plugin=plugin.get("slug"),
                                                version=plugin.get("version"), detail=exc)
                                 failed_key = (plugin.get("slug"), str(plugin.get("version", "")))
-                                if retry_attempts.get(failed_key, 1) < 3:
+                                attempt = retry_attempts.get(failed_key, 1)
+                                delay = retry_delay_seconds(attempt, exc)
+                                if delay is not None:
                                     seen_this_session.discard(failed_key)
-                                    delay = min(60 * (2 ** (retry_attempts[failed_key] - 1)), 600)
                                     retry_after[failed_key] = time.monotonic() + delay
-                                    state["retry_note"] = f"Retrying {failed_key[0]} after {delay}s (attempt {retry_attempts[failed_key] + 1}/3)."
+                                    state["retry_note"] = f"Retrying {failed_key[0]} after {delay}s (attempt {attempt + 1}/3)."
                                     live_log.event("WARN", "plugin_retry_scheduled", plugin=failed_key[0],
-                                                   attempt=retry_attempts[failed_key], delay_seconds=delay)
+                                                   attempt=attempt, delay_seconds=delay)
+                                elif isinstance(exc, NonRetryableScanError):
+                                    state["retry_note"] = (
+                                        f"Not retrying {failed_key[0]} this run: {exc}. "
+                                        "A later run can reconsider this version."
+                                    )
+                                    live_log.event("WARN", "plugin_retry_skipped", plugin=failed_key[0],
+                                                   attempt=attempt, detail=exc)
                                 else:
                                     state["retry_note"] = f"Stopped retrying {failed_key[0]} after 3 attempts; a restart will try again."
                                     live_log.event("ERROR", "plugin_retry_limit", plugin=failed_key[0], attempts=3)
@@ -992,12 +1157,8 @@ def stream(args):
                        failures=state["failures"])
         publish()
         if store:
-            try:
-                store.finish_run(run_id, "completed", scanned_plugins=state["scanned"],
-                                 failed_plugins=state["failures"], signal_count=state["signal_count"],
-                                 alert_count=0)
-            except Exception as exc:
-                state["supabase_error"] = str(exc)[:300]
+            finish_interrupted_stream_run(store, run_id, state, live_log)
+            publish()
         print(f"\nPhots stopped cleanly. Live report: {report_path}")
 
 
@@ -1024,14 +1185,31 @@ def api_url(params: dict[str, str]) -> str:
     return API + "?" + urllib.parse.urlencode(params)
 
 
+def plugin_query_params(browse: str, page: int, per_page: int, search: str | None = None):
+    params = {
+        "action": "query_plugins",
+        "request[per_page]": str(per_page),
+        "request[page]": str(page),
+        "request[fields][active_installs]": "1",
+    }
+    if search:
+        params["request[search]"] = search
+    else:
+        params["request[browse]"] = browse
+    return params
+
+
+def feed_label(browse: str, search: str | None = None):
+    return f"search: {search}" if search else browse
+
+
 def catalog(args):
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
     plugins = []
+    search = (getattr(args, "search", None) or "").strip() or None
     for page in range(1, args.pages + 1):
-        params = {"action": "query_plugins", "request[browse]": args.browse,
-                  "request[per_page]": str(args.per_page), "request[page]": str(page),
-                  "request[fields][active_installs]": "1"}
+        params = plugin_query_params(args.browse, page, args.per_page, search)
         data = get_json(api_url(params))
         plugins.extend(data.get("plugins", []))
         print(f"Catalog page {page}: {len(data.get('plugins', []))} entries", file=sys.stderr)
@@ -1046,7 +1224,8 @@ def catalog(args):
         store = SupabaseStore()
         store.verify()
         store.upsert_catalog(eligible)
-    print(f"Saved {len(eligible)} plugins above the install threshold to {out / 'catalog.json'}")
+    print(f"Saved {len(eligible)} plugins above the install threshold from "
+          f"'{feed_label(args.browse, search)}' to {out / 'catalog.json'}")
 
 
 AUDIT_MANIFESTS = {
@@ -1759,50 +1938,95 @@ def local_security_audit(args):
     print(f"Local security audit complete. Report: {markdown_path}")
 
 
-def safe_extract(data: bytes, dest: Path):
-    if len(data) > MAX_ZIP_BYTES:
-        raise ValueError("archive exceeds configured compressed size limit")
-    dest.mkdir(parents=True, exist_ok=True)
-    total = 0
-    with zipfile.ZipFile(__import__("io").BytesIO(data)) as zf:
-        if len(zf.infolist()) > 100_000:
-            raise ValueError("archive contains too many entries")
-        for info in zf.infolist():
-            target = (dest / info.filename).resolve()
-            if dest.resolve() not in target.parents and target != dest.resolve():
-                raise ValueError("archive contains an unsafe path")
-            total += info.file_size
-            if total > MAX_ZIP_BYTES:
-                raise ValueError("archive exceeds configured expanded size limit")
-        zf.extractall(dest)
-
-
 def download_one(plugin, root: Path, progress=None):
     slug = plugin["slug"]
     version = str(plugin["version"])
     if not re.fullmatch(r"[a-z0-9][a-z0-9._-]*", slug) or slug in {".", ".."}:
-        raise ValueError("plugin slug contains unsupported path characters")
+        raise NonRetryableScanError("plugin slug contains unsupported path characters")
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._+-]*", version) or version in {".", ".."}:
-        raise ValueError("plugin version contains unsupported path characters")
-    target = root / slug / version
-    marker = target / ".complete"
-    if marker.is_file():
-        if progress:
-            progress("source cache", "reusing downloaded archive")
-        return slug, version, target, True
+        raise NonRetryableScanError("plugin version contains unsupported path characters")
     package_url = urllib.parse.urlparse(plugin["download_link"])
     if package_url.scheme != "https" or package_url.hostname != "downloads.wordpress.org":
-        raise ValueError("package URL is not an HTTPS WordPress.org download")
+        raise NonRetryableScanError("package URL is not an HTTPS WordPress.org download")
+    target = root / slug / version
+    root_resolved = root.resolve()
+    if root_resolved not in target.resolve().parents:
+        raise NonRetryableScanError("source cache path resolves outside the configured source directory")
+    marker = target / ".complete"
+    had_cache_marker = marker.exists() or marker.is_symlink()
+    if marker.is_file() and not marker.is_symlink():
+        saved = {}
+        try:
+            loaded = json.loads(marker.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                saved = loaded
+        except (json.JSONDecodeError, OSError, UnicodeDecodeError):
+            pass
+        saved_verification = saved.get("verification")
+        if (saved.get("fetcher_version") == wp_fetcher.__version__
+                and saved.get("version_api") == version
+                and isinstance(saved_verification, dict)):
+            if progress:
+                progress("source cache", "reusing verified download")
+            return slug, version, target, True, saved_verification
+    if target.is_symlink():
+        target.unlink()
+    elif target.is_dir():
+        shutil.rmtree(target)
+    elif target.exists():
+        target.unlink()
+    if had_cache_marker:
+        if progress:
+            progress("source cache", "refreshing an unverified legacy cache")
     if progress:
-        progress("downloading ZIP", "requesting archive from downloads.wordpress.org")
-    data = fetch_bytes(plugin["download_link"], MAX_ZIP_BYTES, 60)
+        progress("downloading ZIP", "resumable transfer from downloads.wordpress.org")
+    archive_path = root / ".downloads" / slug / f"{version}.zip"
+    archive_parent = archive_path.parent.resolve()
+    if root_resolved not in archive_parent.parents:
+        raise NonRetryableScanError("download cache path resolves outside the configured source directory")
+    if archive_path.is_symlink() or (archive_path.exists() and not archive_path.is_file()):
+        raise NonRetryableScanError("download cache entry is not a regular file")
+    fetch_config = wp_fetcher.FetcherConfig(
+        staging=root,
+        retries=2,
+        timeout_secs=60,
+        max_download_mb=MAX_ZIP_BYTES // (1024 * 1024),
+        max_uncompressed_mb=500,
+    )
+    try:
+        _, archive_bytes = wp_fetcher.download_plugin(
+            plugin["download_link"], archive_path, fetch_config)
+    except wp_fetcher.FetcherPolicyError as exc:
+        raise NonRetryableScanError(str(exc)) from exc
     if progress:
-        progress("extracting source", f"received {len(data) / 1024 / 1024:.1f} MiB")
-    safe_extract(data, target)
-    marker.write_text("ok\n", encoding="utf-8")
+        progress("verifying archive", f"received {archive_bytes / 1024 / 1024:.1f} MiB; checking ZIP integrity and version")
+    verification = wp_fetcher.verify_plugin_version(archive_path, version)
+    if verification.get("error"):
+        raise NonRetryableScanError(verification["error"])
+    if verification.get("drift") and progress:
+        progress(
+            "version drift",
+            f"API reports {version}; archive reports {verification['version_verified']} "
+            f"({verification['version_source']}); findings will use the archive version",
+        )
     if progress:
-        progress("source ready", "archive safely extracted")
-    return slug, version, target, False
+        progress("extracting source", f"expanded-size cap: {fetch_config.max_uncompressed_mb} MiB")
+    try:
+        file_count = wp_fetcher.extract_plugin_zip(archive_path, target, fetch_config)
+    except wp_fetcher.FetcherPolicyError as exc:
+        raise NonRetryableScanError(str(exc)) from exc
+    marker.write_text(json.dumps({
+        "fetcher_version": wp_fetcher.__version__,
+        "version_api": version,
+        "verification": verification,
+        "zip_sha256": wp_fetcher.sha256_file(archive_path),
+        "archive_bytes": archive_bytes,
+        "files_count": file_count,
+    }, indent=2), encoding="utf-8")
+    archive_path.unlink(missing_ok=True)
+    if progress:
+        progress("source ready", f"archive safely extracted ({file_count} files)")
+    return slug, version, target, False, verification
 
 
 def scan_tree(slug: str, version: str, root: Path, max_files: int, max_findings: int, progress=None):
@@ -1932,9 +2156,16 @@ def download_and_scan(plugin, source_root: Path, max_files: int, max_findings: i
                       ai_reviewer: AIReviewer | None = None, ai_max_findings: int = 50):
     if progress:
         progress("starting", "worker accepted plugin")
-    slug, version, path, cached = download_one(plugin, source_root, progress)
-    return scan_source_tree(plugin, path, max_files, max_findings, semgrep_timeout,
-                             semgrep_auto, progress, ai_reviewer, ai_max_findings, cached)
+    slug, version, path, cached, verification = download_one(plugin, source_root, progress)
+    scan_plugin = dict(plugin)
+    scan_plugin["version"] = str(verification.get("version_verified") or version)
+    result = scan_source_tree(scan_plugin, path, max_files, max_findings, semgrep_timeout,
+                              semgrep_auto, progress, ai_reviewer, ai_max_findings, cached)
+    for finding in result[1]:
+        finding["version_api"] = version
+        finding["version_source"] = verification.get("version_source", "api")
+        finding["version_drift"] = bool(verification.get("drift"))
+    return result
 
 
 def scan_source_tree(plugin: dict, path: Path, max_files: int, max_findings: int,
@@ -1973,16 +2204,22 @@ def download_compare_and_scan(plugin: dict, staging_root: Path, previous_hash: s
     def progress(phase, detail):
         print(f"  [{slug}] {phase}: {detail}", file=sys.stderr, flush=True)
     with tempfile.TemporaryDirectory(prefix="phots-drift-", dir=staging_root) as temporary:
-        _, _, source, _ = download_one(plugin, Path(temporary), progress)
+        _, api_version, source, _, verification = download_one(plugin, Path(temporary), progress)
         current_hash = fingerprint_source(source, max_files)
         if previous_hash and current_hash == previous_hash:
-            return "unchanged", current_hash, [], None
-        scanned = scan_source_tree(plugin, source, max_files, max_findings,
+            return "unchanged", current_hash, [], None, verification
+        scan_plugin = dict(plugin)
+        scan_plugin["version"] = str(verification.get("version_verified") or api_version)
+        scanned = scan_source_tree(scan_plugin, source, max_files, max_findings,
                                    semgrep_timeout, semgrep_auto, progress,
                                    ai_reviewer, ai_max_findings, cached=False,
                                    source_hash=current_hash)
         _, findings, _, semgrep_status, source_hash = scanned
-        return ("baseline_created" if not previous_hash else "source_changed"), source_hash, findings, semgrep_status
+        for finding in findings:
+            finding["version_api"] = api_version
+            finding["version_source"] = verification.get("version_source", "api")
+            finding["version_drift"] = bool(verification.get("drift"))
+        return ("baseline_created" if not previous_hash else "source_changed"), source_hash, findings, semgrep_status, verification
 
 
 def drift(args):
@@ -2000,10 +2237,9 @@ def drift(args):
         "SELECT slug,version,source_fingerprint FROM completed").fetchall()}
 
     plugins = []
+    search = (getattr(args, "search", None) or "").strip() or None
     for page in range(1, args.pages + 1):
-        params = {"action": "query_plugins", "request[browse]": args.browse,
-                  "request[per_page]": str(args.per_page), "request[page]": str(page),
-                  "request[fields][active_installs]": "1"}
+        params = plugin_query_params(args.browse, page, args.per_page, search)
         try:
             data = get_json(api_url(params))
         except Exception as exc:
@@ -2051,9 +2287,12 @@ def drift(args):
             plugin = jobs[future]
             key = (str(plugin["slug"]), str(plugin["version"]))
             try:
-                status, source_hash, findings, semgrep_status = future.result()
+                status, source_hash, findings, semgrep_status, verification = future.result()
                 completed_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
                 results.append({"slug": key[0], "version": key[1], "status": status,
+                                "version_verified": verification.get("version_verified"),
+                                "version_source": verification.get("version_source"),
+                                "version_drift": bool(verification.get("drift")),
                                 "previous_fingerprint": baselines[key],
                                 "current_fingerprint": source_hash, "signals": len(findings)})
                 if status == "unchanged":
@@ -2099,6 +2338,7 @@ def drift(args):
             "vulnerability_type": finding.get("class_hint"), "review_status": "unreviewed",
         }).copy()
         finding["priority"] = "UNCLASSIFIED"
+        finding["review_priority"] = review_priority(finding)["code"]
         decisions.append(finding)
     alerts = [item for item in decisions if item.get("scope_decision", {}).get("decision") == "PASS"
               and not (item.get("ai_review") or {}).get("auto_closed")]
@@ -2108,25 +2348,63 @@ def drift(args):
         "scan_type": "source_drift",
         "started_at": wall_started,
         "finished_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-        "feed": args.browse, "pages": args.pages, "eligible_feed_entries": len(eligible),
+        "feed": args.browse, "search": search,
+        "feed_label": feed_label(args.browse, search),
+        "pages": args.pages, "eligible_feed_entries": len(eligible),
         "matched_previous_versions": len(candidates), "new_versions_left_for_stream": len(new_versions),
         "source_changed": changed, "baseline_created": baselines_created,
         "unchanged": unchanged, "failures": failures, "semgrep_failures": semgrep_failures,
-        "signals": len(decisions), "results": results, "database": str(history_path),
+        "signals": len(decisions),
+        "review_priority_counts": {
+            code: sum(review_priority(item)["code"] == code for item in decisions)
+            for code in ("P1", "P2", "P3", "UNCLASSIFIED")
+        },
+        "results": results, "database": str(history_path),
         "scan_report": str(drift_out / "report.html"),
     }
     atomic_json(drift_out / "phots-drift-report.json", summary)
     lines = ["# Phots source drift report", "",
              "> This is a separate, one-shot drift scan. It compares fresh WordPress.org archives with saved fingerprints of supported source files (.php, .py, .go, .rs). A changed fingerprint triggers a new static scan; unchanged versions are not rescanned.", "",
-             f"- Feed: **{args.browse}** · eligible entries: **{len(eligible)}**",
+             f"- Feed: **{feed_label(args.browse, search)}** · eligible entries: **{len(eligible)}**",
              f"- Previously scanned versions checked: **{len(candidates)}**",
              f"- Source changed and rescanned: **{changed}**",
              f"- Missing baseline scanned: **{baselines_created}**",
              f"- Unchanged: **{unchanged}** · failures: **{failures}**",
              f"- New versions left for regular stream: **{len(new_versions)}**",
-             f"- Candidate signals from changed sources: **{len(decisions)}**", "", "## Plugin results", ""]
+             f"- Candidate signals from changed sources: **{len(decisions)}**", "",
+             "## Suggested review priority (not vulnerability severity)", ""]
+    drift_priority_order = ("P1", "P2", "P3", "UNCLASSIFIED")
+    for code in drift_priority_order:
+        count = sum(review_priority(item)["code"] == code for item in decisions)
+        lines.append(f"- **{REVIEW_PRIORITY_LABELS[code]}:** {count} — {REVIEW_PRIORITY_BASIS[code]}")
+    drift_class_counts = {}
+    for finding in decisions:
+        label = VULN_LABELS.get(finding.get("class_hint"), "Unclassified security pattern")
+        drift_class_counts[label] = drift_class_counts.get(label, 0) + 1
+    lines += ["", "## Leads by vulnerability class", ""]
+    lines.extend(f"- **{label}:** {count}" for label, count in sorted(drift_class_counts.items()))
+    if not drift_class_counts:
+        lines.append("No lead categories in this drift report.")
+    lines += ["", "## Leads", ""]
+    for code in drift_priority_order:
+        priority_findings = [item for item in decisions if review_priority(item)["code"] == code]
+        if not priority_findings:
+            continue
+        lines.append(f"### {REVIEW_PRIORITY_LABELS[code]}")
+        for finding in priority_findings:
+            lines.append(
+                f"- `{finding.get('plugin_slug', 'plugin')}` — "
+                f"{VULN_LABELS.get(finding.get('class_hint'), 'Unclassified security pattern')} · "
+                f"`{finding.get('file', '?')}:{finding.get('line', '?')}` · "
+                f"{finding.get('confidence', 'unknown')} confidence · "
+                f"{ai_disposition_label(finding)} · signal `{finding.get('signal_id', '')}`"
+            )
+    lines += ["", "## Plugin results", ""]
     for result in results:
-        lines.append(f"- **{result['status']}** — `{result['slug']}` {result['version']} · {result.get('signals', 0)} signals")
+        version_note = (f" · archive version {result['version_verified']}"
+                        if result.get("version_drift") else "")
+        lines.append(f"- **{result['status']}** — `{result['slug']}` {result['version']}"
+                     f"{version_note} · {result.get('signals', 0)} signals")
     if not results:
         lines.append("No previously scanned versions from this feed matched the drift check.")
     (drift_out / "phots-drift-report.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
@@ -2207,6 +2485,8 @@ def run(args):
                       file=sys.stderr)
     write_memory_snapshot(out, history)
     history.close()
+    for finding in findings:
+        finding["review_priority"] = review_priority(finding)["code"]
     (out / "signals.json").write_text(json.dumps(findings, indent=2), encoding="utf-8")
 
     # Human-review decisions are supplied separately. Missing metadata always fails closed.
@@ -2233,6 +2513,7 @@ def run(args):
         record["priority"] = {"high_threat": "P1_HIGH_THREAT",
                               "common_dangerous": "P2_COMMON_DANGEROUS",
                               "standard_other": "P3_STANDARD_OTHER"}.get(tier, "UNCLASSIFIED")
+        record["review_priority"] = review_priority(record)["code"]
         decisions.append(record)
         if scope_result.get("decision") == "PASS" and not (finding.get("ai_review") or {}).get("auto_closed"):
             alerts.append({**record, "scope": "standard_researcher_candidate"})
@@ -2265,9 +2546,49 @@ def run(args):
 
 
 def launch_interactive():
+    try:
+        return _launch_interactive()
+    except EOFError:
+        print("No terminal input is available. Run `phots` from an interactive terminal.",
+              file=sys.stderr)
+        return 2
+
+
+def choose_discovery_feed():
+    choices = {
+        "1": ("updated", "Recently updated — best for ongoing release discovery"),
+        "2": ("popular", "Popular — broad, high-install plugins"),
+        "3": ("new", "New — recently added; often below the install threshold"),
+        "4": ("recommended", "Recommended — WordPress.org curated selection"),
+        "5": ("beta", "Beta — pre-release plugins"),
+        "6": ("top-rated", "Top rated — highly rated plugins"),
+    }
+    while True:
+        print("\n  Where should Phots discover plugins?")
+        for key, (_, description) in choices.items():
+            print(f"  {key}  {description}")
+        print("  7  Search WordPress.org by keyword")
+        selection = input("  Discovery source [1-7, Enter = recently updated]: ").strip().lower()
+        if not selection:
+            return "updated", None
+        if selection in choices:
+            return choices[selection][0], None
+        if selection in {feed for feed, _ in choices.values()}:
+            return selection, None
+        if selection == "7":
+            search = input("  Search terms: ").strip()
+            if search:
+                return "updated", search
+            print("  Enter at least one search term.")
+            continue
+        print("  Choose 1-7 or a listed feed name.")
+
+
+def _launch_interactive():
     """Friendly no-argument launcher with a hardware-aware Phots stream setup."""
     if not sys.stdin.isatty():
-        print("Choose a mode: python scanner.py stream, scan, drift, or catalog", file=sys.stderr)
+        print("The Phots interactive launcher needs a terminal. Run `phots --help` to see available commands.",
+              file=sys.stderr)
         return 2
     while True:
         print("\n  PHOTS · WordPress plugin research")
@@ -2300,10 +2621,7 @@ def launch_interactive():
             if not 1 <= workers <= 10:
                 print("  Please enter a number from 1 to 10.")
                 continue
-            browse = input("  WordPress.org feed [popular/new, Enter = popular]: ").strip().lower() or "popular"
-            if browse not in {"new", "popular", "recommended", "beta"}:
-                print("  Unknown feed; using popular.")
-                browse = "popular"
+            browse, search = choose_discovery_feed()
             output = input("  Output directory [Enter = output]: ").strip() or "output"
             supabase = input("  Also persist to connected Supabase? [y/N]: ").strip().lower() in {"y", "yes"}
             ai_triage = input("  Enable AI lead triage from your configured endpoint? [y/N]: ").strip().lower() in {"y", "yes"}
@@ -2316,7 +2634,7 @@ def launch_interactive():
                     ai_triage = False
             options = argparse.Namespace(
                 out=output, report=None, max_workers=10, workers=workers,
-                browse=browse, pages_per_cycle=2, per_page=100, min_installs=25,
+                browse=browse, search=search, pages_per_cycle=2, per_page=100, min_installs=25,
                 poll_seconds=60, max_files_per_plugin=5000, max_findings_per_plugin=1000,
                 semgrep_timeout=120, semgrep_auto=False, tui=True, supabase=supabase,
                 ai_triage=ai_triage, ai_base_url=None, ai_model=None,
@@ -2351,10 +2669,7 @@ def launch_interactive():
             run(options)
             return 0
         if choice == "3":
-            browse = input("  WordPress.org feed [popular/new, Enter = popular]: ").strip().lower() or "popular"
-            if browse not in {"new", "popular", "recommended", "beta"}:
-                print("  Unknown feed; using popular.")
-                browse = "popular"
+            browse, search = choose_discovery_feed()
             output = input("  Output directory [Enter = output]: ").strip() or "output"
             supabase = input("  Also persist to connected Supabase? [y/N]: ").strip().lower() in {"y", "yes"}
             ai_triage = input("  Enable AI lead triage from your configured endpoint? [y/N]: ").strip().lower() in {"y", "yes"}
@@ -2366,7 +2681,7 @@ def launch_interactive():
                     print(f"  {exc} Continuing this scan without AI triage.")
                     ai_triage = False
             options = argparse.Namespace(
-                browse=browse, pages=2, per_page=100, min_installs=25, delay=1.0,
+                browse=browse, search=search, pages=2, per_page=100, min_installs=25, delay=1.0,
                 workers=2, max_files_per_plugin=5000, max_findings_per_plugin=1000,
                 semgrep_timeout=120, semgrep_auto=False, out=output, supabase=supabase,
                 ai_triage=ai_triage, ai_base_url=None, ai_model=None,
@@ -2399,7 +2714,10 @@ def main():
     p = sub.add_parser("catalog", help="collect a bounded WordPress.org plugin catalog")
     p.add_argument("--pages", type=int, default=2)
     p.add_argument("--per-page", type=int, default=100)
-    p.add_argument("--browse", choices=["popular", "new", "recommended", "beta"], default="popular")
+    p.add_argument("--browse",
+                   choices=["updated", "popular", "new", "recommended", "beta", "top-rated"],
+                   default="updated", help="WordPress.org discovery feed (default: recently updated)")
+    p.add_argument("--search", help="search WordPress.org by keyword instead of using a browse feed")
     p.add_argument("--min-installs", type=int, default=25)
     p.add_argument("--delay", type=float, default=1.0)
     p.add_argument("--out", default="output")
@@ -2423,7 +2741,10 @@ def main():
     p.add_argument("--supabase", action="store_true", help="persist this run, its signals, and reviewed scope decisions")
     p.set_defaults(func=run)
     p = sub.add_parser("stream", help="continuously scan newly observed WordPress.org plugin versions")
-    p.add_argument("--browse", choices=["popular", "new", "recommended", "beta"], default="popular")
+    p.add_argument("--browse",
+                   choices=["updated", "popular", "new", "recommended", "beta", "top-rated"],
+                   default="updated", help="WordPress.org discovery feed (default: recently updated)")
+    p.add_argument("--search", help="search WordPress.org by keyword instead of using a browse feed")
     p.add_argument("--pages-per-cycle", type=int, default=2)
     p.add_argument("--per-page", type=int, default=100)
     p.add_argument("--min-installs", type=int, default=25)
@@ -2449,7 +2770,10 @@ def main():
     p.add_argument("--supabase", action="store_true", help="also persist stream catalog and signals to Supabase")
     p.set_defaults(func=stream)
     p = sub.add_parser("drift", help="one-shot fresh-source fingerprint comparison and rescan of changed versions")
-    p.add_argument("--browse", choices=["popular", "new", "recommended", "beta"], default="popular")
+    p.add_argument("--browse",
+                   choices=["updated", "popular", "new", "recommended", "beta", "top-rated"],
+                   default="updated", help="WordPress.org discovery feed (default: recently updated)")
+    p.add_argument("--search", help="search WordPress.org by keyword instead of using a browse feed")
     p.add_argument("--pages", type=int, default=2, help="WordPress.org feed pages to compare")
     p.add_argument("--per-page", type=int, default=100)
     p.add_argument("--min-installs", type=int, default=25)
@@ -2487,6 +2811,10 @@ def main():
                    help="run PHPCS/PHPStan/Psalm using the project's configuration; only for trusted projects")
     p.set_defaults(func=local_security_audit, include_dependencies=True)
     args = parser.parse_args()
+    if getattr(args, "search", None) is not None:
+        args.search = args.search.strip()
+        if not args.search:
+            parser.error("search terms must not be empty")
     if getattr(args, "pages", 1) < 1 or getattr(args, "per_page", 1) < 1:
         parser.error("pages and per-page must be positive")
     if getattr(args, "workers", 1) < (0 if args.command == "stream" else 1) or getattr(args, "workers", 1) > (10 if args.command == "stream" else 4):
