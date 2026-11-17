@@ -8,11 +8,31 @@ version = "0.1.0"
 description = "Local-first WordPress plugin source triage and audit workflow"
 requires-python = ">=3.10"
 
+[project.optional-dependencies]
+test = ["pytest>=7", "PyYAML>=6"]
+
 [project.scripts]
 phots = "scanner:main"
 
 [tool.setuptools]
-py-modules = ["scanner", "scope_filter", "ai_triage", "supabase_store", "wp_fetcher", "wordfence_integrator", "patchstack_integrator", "wordfence_severity"]
+py-modules = [
+    "scanner",
+    "scope_filter",
+    "ai_triage",
+    "context_filter",
+    "supabase_store",
+    "wp_fetcher",
+    "wordfence_integrator",
+    "patchstack_integrator",
+    "wordfence_severity",
+    "rules_engine",
+    "logger",
+    "exploitability_assessment",
+    "cross_version_dedup",
+    "hook_filter_chain",
+    "automated_rescan",
+    "v02_architecture",
+]
 
 [tool.setuptools.data-files]
 "share/phots/rules" = ["rules/wordpress_multilang.yml"]
